@@ -55,7 +55,7 @@ You can also download `kimi-code-statusline-bash-<version>.zip` from [Releases](
 - It puts `statusline.sh` and a small `statusline.cmd` launcher into `.kimi-code\statusline-bash\` in your user folder (or into `%KIMI_CODE_HOME%\statusline-bash\` if you set `KIMI_CODE_HOME`).
 - It sets `command` under `[status_line]` in Kimi Code's `tui.toml` to that launcher. The rest of `tui.toml` stays as it was.
 - Any file it changes is first backed up to `<file>.bak-<date>-<time>`.
-- It finds Git Bash and jq and writes their paths into the launcher, because the shell that Kimi Code starts may not have your terminal's PATH.
+- It finds Git Bash and jq and records where they are (Git Bash in the launcher, jq in `jq-path.txt` next to it), because the shell that Kimi Code starts may not have your terminal's PATH.
 - At the end it runs the status line once and shows the result.
 
 If `tui.toml` already runs some other status line command, the installer stops without changing anything. With `-Force` it replaces that command, and `uninstall.ps1` puts it back later.
@@ -79,6 +79,8 @@ This removes the `[status_line]` command from `tui.toml` (or restores the one th
 Edit `.kimi-code\statusline-bash\statusline.sh` in your user folder. Kimi Code runs the file fresh every time, so a change shows within a second. The parts are put together near the end of the file, in display order, and the colors are plain ANSI codes (`92` green, `93` yellow, `91` red and so on). Keep that part fast: Kimi Code drops any run that takes more than 300 ms (see [How it works](#how-it-works)).
 
 An update overwrites your changes, but the installer keeps your version as `statusline.sh.bak-<date>-<time>`.
+
+To use a different jq, run the installer with `-JqPath`, or set the environment variable `KIMI_STATUSLINE_JQ` to its path.
 
 ## How it works
 

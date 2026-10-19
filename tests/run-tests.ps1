@@ -173,12 +173,15 @@ try {
     Check 'statusline.sh installed with LF line endings' ((Test-Path -LiteralPath "$app\statusline.sh") -and -not (Read-Text "$app\statusline.sh").Contains("`r"))
     $shimBytes = [IO.File]::ReadAllBytes("$app\statusline.cmd")
     Check 'statusline.cmd is ASCII' (-not ($shimBytes | Where-Object { $_ -gt 127 }))
-    Check 'statusline.cmd records jq' ((Read-Text "$app\statusline.cmd") -match 'set "KIMI_STATUSLINE_JQ=')
+    $jqRecorded = (Read-Text "$app\jq-path.txt").Trim()
+    Check 'jq-path.txt records jq' ($jqRecorded -and (Test-Path -LiteralPath $jqRecorded)) $jqRecorded
     $cmd = Get-Command-From-Tui $A
     Check 'tui.toml command is the ^-escaped launcher path' ($cmd -and $cmd.EndsWith('/statusline-bash/statusline.cmd') -and $cmd.Contains('kimi^ home^ ^(A^)^ ^&^ co')) "command = $cmd"
     $tui = Read-Text "$A\tui.toml"
     Check 'tui.toml keeps everything else' ($tui.StartsWith($KimiDefaultTui.TrimEnd("`n"))) $tui
     Check 'tui.toml backed up' ((Get-ChildItem -LiteralPath $A -Filter 'tui.toml.bak-*').Count -eq 1)
+    $infoText = Read-Text "$app\install.json"
+    Check 'install.json records no previous line (as null)' ($infoText -match '"previousLine":\s*null' -and $infoText -match '"createdTable":\s*true') $infoText
 
     $r = Invoke-Script (Join-Path $Repo 'install.ps1') @('-KimiHome', $A)
     Check 'running install.ps1 again succeeds' ($r.Code -eq 0) $r.Output
@@ -251,10 +254,10 @@ try {
         Check 'quota part' ($o.Text -match $want) $o.Text
         Check 'quota colored green under 60%' ($o.Raw.Contains("$Esc[92m$($G.quota) 5h")) $o.Raw
     } else { Skip 'quota fetch' 'no Python for the mock server' }
-    # also: a jq under %LOCALAPPDATA% (TEMP is there) goes into the launcher as %LOCALAPPDATA%\...
+    # also: a jq in a folder with a non-ASCII name (its path goes into jq-path.txt, as UTF-8)
     $jqCopy = $null
     foreach ($j in @(Get-Command jq.exe -All -CommandType Application -ErrorAction SilentlyContinue)) {
-        $dest = Join-Path $Root "bin$($script:Passed)\jq.exe"
+        $dest = Join-Path $Root ("jq " + [char]0x4E2D + [char]0x6587 + "$($script:Passed)\jq.exe")
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
         Copy-Item -LiteralPath $j.Source -Destination $dest
         if ((& $dest -n '1' 2>$null) -eq '1') { $jqCopy = $dest; break }   # runs without its own folder's DLLs
@@ -264,14 +267,15 @@ try {
     if ($jqCopy) { $nArgs += @('-JqPath', $jqCopy) }
     $r = Invoke-Script (Join-Path $Repo 'install.ps1') $nArgs
     Check 'install into an empty tui.toml' ($r.Code -eq 0 -and (Get-Command-From-Tui $N)) $r.Output
-    if ($jqCopy -and $jqCopy.StartsWith($env:LOCALAPPDATA + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        Check 'launcher writes the jq path as %LOCALAPPDATA%\...' ((Read-Text "$N\statusline-bash\statusline.cmd") -match 'set "KIMI_STATUSLINE_JQ=%LOCALAPPDATA%\\')
+    if ($jqCopy) {
+        Check 'non-ASCII jq folder: launcher stays ASCII' (-not ([IO.File]::ReadAllBytes("$N\statusline-bash\statusline.cmd") | Where-Object { $_ -gt 127 }))
+        Check '... and jq-path.txt holds the path' ((Read-Text "$N\statusline-bash\jq-path.txt").Trim() -eq $jqCopy) (Read-Text "$N\statusline-bash\jq-path.txt")
         $nsid = 'session_n'
         Write-Text "$N\sessions\wd_n\$nsid\state.json" ('{"createdAt":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + '}')
         Write-Text "$N\sessions\wd_n\$nsid\agents\main\wire.jsonl" ((Edit-Call 'n1' 'a' 'b') + (Tool-Result 'n1' 'Replaced 1 occurrence'))
         Invoke-Render $N -Sid $nsid | Out-Null
         Check '... and that jq does the counting' (Wait-Until { (Read-Text "$N\cache\statusline\$nsid.state").StartsWith("1`t1`t") }) (Read-Text "$N\cache\statusline\$nsid.state")
-    } else { Skip 'jq path as %LOCALAPPDATA%' 'no stand-alone jq.exe to copy, or TEMP outside LOCALAPPDATA' }
+    } else { Skip 'non-ASCII jq folder' 'no stand-alone jq.exe to copy' }
     Invoke-Render $N | Out-Null
     $ok = Wait-Until { (Read-Text (Join-Path $N 'cache\statusline\quota')) -match "`t-`n?$" }
     Check 'no Kimi Code plan: quota marked as none' $ok (Read-Text (Join-Path $N 'cache\statusline\quota'))
@@ -298,8 +302,86 @@ try {
     $r = Invoke-Script (Join-Path $Repo 'uninstall.ps1') @('-KimiHome', $B)
     Check 'uninstall.ps1 puts the old command back' ($r.Code -eq 0 -and (Read-Text "$B\tui.toml") -eq $otherTui) (Read-Text "$B\tui.toml")
 
+    # ------------------------------------------------------- other tui.toml forms ---
+    Write-Host 'tui.toml forms'
+    $install = Join-Path $Repo 'install.ps1'
+    $uninstall = Join-Path $Repo 'uninstall.ps1'
+    foreach ($t in @(
+            @{ name = 'quoted key'; tui = "[status_line]`n`"command`" = `"C:/tools/other.cmd`"`n" },
+            @{ name = 'quoted table name'; tui = "[`"status_line`"]`ncommand = `"C:/tools/other.cmd`"`n" },
+            @{ name = 'our path inside another command'; tui = "[status_line]`ncommand = `"echo C:/tools/statusline-bash/statusline.cmd`"`n" })) {
+        $h = New-KimiHome ('form ' + $t.name) -Tui $t.tui
+        Write-Text "$h\statusline-bash\statusline.sh" "custom`n"
+        $r = Invoke-Script $install @('-KimiHome', $h)
+        Check "$($t.name): seen as another tool's command" ($r.Code -ne 0 -and $r.Output -match 'another status line command') $r.Output
+        Check '... and nothing is written' ((Read-Text "$h\tui.toml") -ceq $t.tui -and (Read-Text "$h\statusline-bash\statusline.sh") -ceq "custom`n" -and -not (Test-Path -LiteralPath "$h\statusline-bash\statusline.cmd"))
+    }
+    $zh = [string][char]0x4E2D
+    foreach ($t in @(
+            @{ name = 'non-ASCII command'; line = "command = `"C:/tools/$zh.cmd`""; value = "C:/tools/$zh.cmd" },
+            @{ name = 'escaped command'; line = 'command = "C:/tools/' + '\' + 'u4e2d.cmd" # note'; value = "C:/tools/$zh.cmd" },
+            @{ name = 'literal string'; line = "command = 'C:\tools\other.cmd'"; value = 'C:\tools\other.cmd' })) {
+        $tui = "theme = `"dark`"`n`n[status_line]`n$($t.line)`n"
+        $h = New-KimiHome ('round ' + $t.name) -Tui $tui
+        $r = Invoke-Script $install @('-KimiHome', $h, '-Force')
+        $info = [IO.File]::ReadAllText("$h\statusline-bash\install.json", $Utf8) | ConvertFrom-Json
+        Check "$($t.name): -Force records it" ($r.Code -eq 0 -and $info.previousCommand -ceq $t.value -and $info.previousLine -ceq $t.line) "$($r.Output) / $($info | ConvertTo-Json -Compress)"
+        $r = Invoke-Script $install @('-KimiHome', $h)
+        Check '... a second install keeps the record' ($r.Code -eq 0 -and ([IO.File]::ReadAllText("$h\statusline-bash\install.json", $Utf8) | ConvertFrom-Json).previousLine -ceq $t.line) $r.Output
+        $r = Invoke-Script $uninstall @('-KimiHome', $h)
+        Check '... and uninstall restores it byte for byte' ($r.Code -eq 0 -and (Read-Text "$h\tui.toml") -ceq $tui) (Read-Text "$h\tui.toml")
+    }
+    $tui = "[status_line] # my choice`n# items = [`"mode`"]`n`n[upgrade]`nauto_install = true`n"
+    $h = New-KimiHome 'table with comments' -Tui $tui
+    $r = Invoke-Script $install @('-KimiHome', $h)
+    Check 'a table with only comments gets the command under its header' ($r.Code -eq 0 -and (Read-Text "$h\tui.toml") -match '^\[status_line\] # my choice\ncommand = "[^"]+"\n# items') (Read-Text "$h\tui.toml")
+    $r = Invoke-Script $uninstall @('-KimiHome', $h)
+    Check '... and uninstall keeps the table and its comments' ((Read-Text "$h\tui.toml") -ceq $tui) (Read-Text "$h\tui.toml")
+    $h = New-KimiHome 'single quoted ours' -Tui ''
+    Invoke-Script $install @('-KimiHome', $h) | Out-Null
+    Write-Text "$h\tui.toml" ((Read-Text "$h\tui.toml") -replace 'command = "([^"]+)"', 'command = ''$1''')
+    $r = Invoke-Script $uninstall @('-KimiHome', $h)
+    Check 'uninstall recognizes its command in a literal string' ($r.Code -eq 0 -and (Read-Text "$h\tui.toml") -notmatch 'command') (Read-Text "$h\tui.toml")
+    $tui = "[status_line]`ncommand = `"C:/tools/other.cmd`" # was = `"C:/x/statusline-bash/statusline.cmd`"`n"
+    $h = New-KimiHome 'comment mentions us' -Tui $tui
+    $r = Invoke-Script $uninstall @('-KimiHome', $h)
+    Check "uninstall leaves another tool's command alone, whatever its comment says" ($r.Code -eq 0 -and (Read-Text "$h\tui.toml") -ceq $tui) (Read-Text "$h\tui.toml")
+
+    # ---------------------------------------------------------------- hardening ---
+    Write-Host 'hardening'
+    $D = New-KimiHome 'kimiD' -Tui ''
+    Invoke-Script $install @('-KimiHome', $D) | Out-Null
+    $dsid = 'session_d'
+    $dsdir = "$D\sessions\wd_d\$dsid"
+    Write-Text "$dsdir\state.json" ('{"createdAt":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + '}')
+    Write-Text "$dsdir\agents\main\wire.jsonl" ((Edit-Call 'd1' 'a' 'b') + (Tool-Result 'd1' 'Replaced 1 occurrence'))
+    function ConvertTo-MsysPath([string]$Path) { '/' + $Path.Substring(0, 1).ToLower() + ($Path.Substring(2) -replace '\\', '/') }
+    $proof = Join-Path $Root 'proof'
+    $dstate = "$D\cache\statusline\$dsid.state"
+    # an offset that bash arithmetic would evaluate: a[$(...)] runs the command substitution
+    Write-Text $dstate ("0`t0`t`nF`t" + (ConvertTo-MsysPath "$dsdir\agents\main\wire.jsonl") + "`ta[`$(printf owned > " + (ConvertTo-MsysPath $proof) + ")]`n")
+    (Get-Item -LiteralPath $dstate).LastWriteTime = (Get-Date).AddHours(-1)
+    Invoke-Render $D -Sid $dsid | Out-Null
+    $ok = Wait-Until { (Read-Text $dstate).StartsWith("1`t1`t") }
+    Check 'a tampered session cache is not evaluated' ($ok -and -not (Test-Path -LiteralPath $proof)) (Read-Text $dstate)
+    if ($Python) {
+        $E = New-KimiHome 'kimiE' -BaseUrl $BaseUrl -Tui ''
+        $cfg = (Read-Text "$E\config.toml") -replace '\[providers\."managed:kimi-code"\]', "  [providers.'managed:kimi-code']" -replace '\[providers\."managed:kimi-code"\.oauth\]', "[ providers . 'managed:kimi-code' . oauth ]"
+        Write-Text "$E\config.toml" $cfg
+        Invoke-Script $install @('-KimiHome', $E) | Out-Null
+        Invoke-Render $E | Out-Null
+        Check 'provider header spelled another way: quota still fetched' (Wait-Until { (Read-Text "$E\cache\statusline\quota") -match "`t5h 5%" }) (Read-Text "$E\cache\statusline\quota")
+    } else { Skip 'provider header spelling' 'no Python for the mock server' }
+
     # ------------------------------------------------------------------ web mode ---
     Write-Host 'web install'
+    # iex from a wrapper script must download, not take a statusline.sh next to the wrapper
+    $wrap = Join-Path $Root 'wrapper'
+    Write-Text "$wrap\statusline.sh" "#!/bin/sh`n# kimi-code-statusline-bash decoy`necho decoy`n"
+    Write-Text "$wrap\setup.ps1" ("# runs kimi-code-statusline-bash's installer`n[IO.File]::ReadAllText('" + $install + "') | Invoke-Expression`n")
+    $W = New-KimiHome 'kimiW' -Tui ''
+    $r = Invoke-Command64 "`$env:KIMI_CODE_HOME = '$W'; try { & '$wrap\setup.ps1' } catch { `"caught: `$_`" }"
+    Check "iex from a wrapper script ignores the wrapper's neighbor" ($r.Output -match 'Downloading https://github\.com/' -and (Read-Text "$W\statusline-bash\statusline.sh") -notmatch 'decoy') $r.Output
     if ($Python) {
         $C = New-KimiHome 'kimiC' -Tui $KimiDefaultTui
         $installer = Join-Path $Repo 'install.ps1'

@@ -29,7 +29,7 @@
     Path to jq.exe. Default: found automatically (PATH, WinGet, Scoop, Chocolatey, conda).
 
 .PARAMETER Force
-    Replace a status line command that something else set in tui.toml. Its old value is
+    Replace a status line command that something else set in tui.toml. Its old line is
     recorded, and uninstall.ps1 puts it back.
 #>
 [CmdletBinding()]
@@ -42,10 +42,9 @@ param(
     [switch]$Force
 )
 
-# A file run of this script (as opposed to `irm ... | iex`) installs the statusline.sh
-# next to it. Checked here: inside the script block below $MyInvocation is the block's.
-$KslSelf = $MyInvocation.MyCommand.Path
-if ($KslSelf -and -not (Select-String -LiteralPath $KslSelf -Pattern 'kimi-code-statusline-bash' -SimpleMatch -Quiet)) { $KslSelf = $null }
+# The file this script runs from, or $null under `irm ... | iex` (a script block literal
+# knows the file it was parsed from; $MyInvocation would be the caller's under iex).
+$KslSelf = { }.File
 
 # Everything runs in a child scope, so `irm ... | iex` leaves no settings behind in the
 # caller's session, and a failure ends the script without closing the window (no `exit`).
@@ -60,11 +59,14 @@ function Say([string]$Message) { Write-Host "  $Message" }
 function Warn([string]$Message) { Write-Host "  ! $Message" -ForegroundColor Yellow }
 function Parent([string]$Path) { if ($Path) { Split-Path -Parent $Path } }
 function Test-File([string]$Path) { $Path -and (Test-Path -LiteralPath $Path -PathType Leaf) }
+function Test-Ascii([string]$Text) { $Text -notmatch '[^\x00-\x7F]' }
 
 if ($env:OS -ne 'Windows_NT') {
     throw 'kimi-code-statusline-bash is for Kimi Code on Windows (it runs on Git for Windows).'
 }
 Write-Host 'kimi-code-statusline-bash installer'
+
+# Nothing is written until every check below has passed.
 
 # ---------------------------------------------------------------- Kimi home ---
 if (-not $KimiHome) {
@@ -78,7 +80,9 @@ if ($KimiHome -match '[%!"]') {
     throw "Kimi Code's home folder $KimiHome contains % ! or `", which a cmd.exe command line cannot carry."
 }
 $AppDir = Join-Path $KimiHome 'statusline-bash'
+$ShimPath = Join-Path $AppDir 'statusline.cmd'
 $TuiPath = Join-Path $KimiHome 'tui.toml'
+$InfoPath = Join-Path $AppDir 'install.json'
 Say "Kimi Code home: $KimiHome"
 
 # ----------------------------------------------------------------- Git Bash ---
@@ -115,6 +119,27 @@ if (-not ($bashMajor -match '^\d+$' -and [int]$bashMajor -ge 5)) {
     throw "$GitBash is not bash 5 or newer (got '$bashMajor'). Update Git for Windows."
 }
 Say "Git Bash: $GitBash"
+
+function ConvertTo-BatchPath([string]$Path) {
+    # %LOCALAPPDATA% & co. for the user's folders, so the .cmd file stays ASCII under a
+    # non-ASCII user name: cmd reads .cmd files in the console code page, not UTF-8
+    $Path = $Path -replace '%', '%%'
+    foreach ($v in 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE') {
+        $root = [Environment]::GetEnvironmentVariable($v)
+        if (-not $root) { continue }
+        $root = $root.TrimEnd('\') -replace '%', '%%'
+        if ($Path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return "%$v%" + $Path.Substring($root.Length) }
+    }
+    $Path
+}
+$bashForBatch = ConvertTo-BatchPath $GitBash
+if (-not (Test-Ascii $bashForBatch)) {   # an 8.3 short name, where the volume has them
+    $short = (New-Object -ComObject Scripting.FileSystemObject).GetFile($GitBash).ShortPath
+    $bashForBatch = ConvertTo-BatchPath $short
+    if (-not (Test-Ascii $bashForBatch)) {
+        throw "Git Bash's path $GitBash has non-ASCII characters, which a .cmd file cannot carry reliably. Install Git for Windows in a folder with an ASCII name, or pass -GitBash with such a copy."
+    }
+}
 
 # ----------------------------------------------------------------------- jq ---
 function Find-Jq {
@@ -168,52 +193,6 @@ if (-not $script.StartsWith('#!') -or -not $script.Contains('kimi-code-statuslin
 $script = $script.TrimStart([char]0xFEFF) -replace "`r`n", "`n"   # bash needs LF
 $ver = if ($script -match '(?m)^KSL_VERSION=(\S+)') { $Matches[1] } else { 'unknown' }
 
-# ------------------------------------------------------------------- files ---
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-function Write-Kept([string]$Path, [byte[]]$Bytes) {
-    # writes $Path, first copying an existing different file to <name>.bak-<stamp>
-    if (Test-File $Path) {
-        $old = [IO.File]::ReadAllBytes($Path)
-        if ([Convert]::ToBase64String($old) -eq [Convert]::ToBase64String($Bytes)) { return }
-        Copy-Item -LiteralPath $Path -Destination "$Path.bak-$stamp"
-        Say "Backed up $Path"
-    }
-    [IO.File]::WriteAllBytes($Path, $Bytes)
-}
-
-function ConvertTo-BatchPath([string]$Path) {
-    # %LOCALAPPDATA% & co. for the user's folders, so the .cmd file stays ASCII even under a
-    # non-ASCII user name (cmd reads .cmd files in the console code page, not UTF-8)
-    $Path = $Path -replace '%', '%%'
-    foreach ($v in 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE') {
-        $root = [Environment]::GetEnvironmentVariable($v)
-        if (-not $root) { continue }
-        $root = $root.TrimEnd('\') -replace '%', '%%'
-        if ($Path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return "%$v%" + $Path.Substring($root.Length) }
-    }
-    $Path
-}
-
-New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-Write-Kept (Join-Path $AppDir 'statusline.sh') $Utf8.GetBytes($script)
-
-$shim = @(
-    '@echo off'
-    "rem kimi-code-statusline-bash $ver launcher, written by install.ps1. Kimi Code runs"
-    'rem [status_line] command through "cmd.exe /d /s /c"; this starts Git Bash on the'
-    'rem statusline.sh next to it. Run install.ps1 again instead of editing this file.'
-)
-if ($JqPath) { $shim += 'set "KIMI_STATUSLINE_JQ=' + (ConvertTo-BatchPath $JqPath) + '"' }
-$shim += '"' + (ConvertTo-BatchPath $GitBash) + '" "%~dp0statusline.sh"'
-$shimText = ($shim -join "`r`n") + "`r`n"
-$oem = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-$shimBytes = $oem.GetBytes($shimText)
-if ($oem.GetString($shimBytes) -ne $shimText) {
-    throw "A path in the launcher cannot be written in code page $($oem.CodePage): $GitBash / $JqPath. Pass -GitBash or -JqPath with another location."
-}
-$ShimPath = Join-Path $AppDir 'statusline.cmd'
-Write-Kept $ShimPath $shimBytes
-
 # ----------------------------------------------------------------- tui.toml ---
 # Kimi runs the command as `cmd.exe /d /s /c <command>` through Node, which wraps it in
 # quotes when it has a space; /s strips them again. So: forward slashes (no TOML escapes),
@@ -221,9 +200,34 @@ Write-Kept $ShimPath $shimBytes
 # part of the path.
 $Command = ($ShimPath -replace '\\', '/') -replace '([ &|<>^(),;=])', '^$1'
 
-function Test-OurCommand([string]$Value) {
-    $v = ($Value -replace '\^', '' -replace '\\', '/').Trim().Trim('"')
-    ($v -ieq ($ShimPath -replace '\\', '/')) -or ($v -imatch '/statusline-bash/statusline\.cmd$')
+# TOML, as far as this installer needs it: bare, "quoted" or 'quoted' key and table names
+$TableRe = '^\s*\[\s*(?:status_line|"status_line"|''status_line'')\s*\]\s*(?:#.*)?$'
+$DottedRe = '^\s*(?:status_line|"status_line"|''status_line'')\s*[.=]'
+$KeyRe = '^\s*(?:command|"command"|''command'')\s*='
+function Get-TomlCommand([string]$Line) {
+    # the string value of a `command = ...` line, or $null for any other form
+    $m = [regex]::Match($Line, $KeyRe + '\s*(?:"((?:[^"\\]|\\.)*)"|''([^'']*)'')\s*(?:#.*)?$')
+    if (-not $m.Success) { return $null }
+    if ($m.Groups[2].Success) { return $m.Groups[2].Value }
+    [regex]::Replace($m.Groups[1].Value, '\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)', [Text.RegularExpressions.MatchEvaluator] {
+        param($e)
+        $c = $e.Groups[1].Value
+        $k = $c.Substring(0, 1)
+        if ($k -ceq 'u') { return [string][char][Convert]::ToInt32($c.Substring(1), 16) }
+        if ($k -ceq 'U') { return [char]::ConvertFromUtf32([Convert]::ToInt32($c.Substring(1), 16)) }
+        if ($k -ceq 'b') { return [string][char]8 }
+        if ($k -ceq 't') { return "`t" }
+        if ($k -ceq 'n') { return "`n" }
+        if ($k -ceq 'f') { return [string][char]12 }
+        if ($k -ceq 'r') { return "`r" }
+        return $c   # \" and \\
+    })
+}
+function Test-OurCommand([string]$Value, [string]$Recorded) {
+    # the whole value is this home's launcher (as written by this installer, or as recorded)
+    $plain = { param($s) ($s -replace '\^(.)', '$1' -replace '\\', '/').Trim() }
+    $v = & $plain $Value
+    ($v -ieq (& $plain $Command)) -or ($Recorded -and $v -ieq (& $plain $Recorded))
 }
 
 $raw = ''
@@ -237,37 +241,46 @@ $nl = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
 $lines = New-Object System.Collections.Generic.List[string]
 if ($raw.Length -gt 0) { $lines.AddRange([string[]]($raw -split "`r?`n")) }
 foreach ($l in $lines) {
-    if ($l -match '^\s*status_line\s*[.=]') {
+    if ($l -match $DottedRe) {
         throw "$TuiPath sets status_line in a form this installer does not edit ($($l.Trim())). Change it to a [status_line] table, or set command = `"$Command`" there yourself."
     }
 }
-
 $header = -1
-for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[\s*status_line\s*\]\s*(#.*)?$') { $header = $i; break } }
+for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match $TableRe) { $header = $i; break } }
 $cmdLine = -1
-$current = $null
 if ($header -ge 0) {
     for ($i = $header + 1; $i -lt $lines.Count -and $lines[$i] -notmatch '^\s*\['; $i++) {
-        if ($lines[$i] -match '^\s*command\s*=') { $cmdLine = $i; break }
+        if ($lines[$i] -match $KeyRe) { $cmdLine = $i; break }
     }
 }
+$current = $null
 if ($cmdLine -ge 0) {
-    $l = $lines[$cmdLine]
-    if ($l -match '^\s*command\s*=\s*"((?:[^"\\]|\\.)*)"\s*(#.*)?$') { $current = $Matches[1] -replace '\\"', '"' -replace '\\\\', '\' }
-    elseif ($l -match "^\s*command\s*=\s*'([^']*)'\s*(#.*)?$") { $current = $Matches[1] }
-    else { throw "Could not read the status line command in ${TuiPath}: $($l.Trim())" }
+    $current = Get-TomlCommand $lines[$cmdLine]
+    if ($null -eq $current) { throw "Could not read the status line command in ${TuiPath}: $($lines[$cmdLine].Trim())" }
 }
 
-$infoPath = Join-Path $AppDir 'install.json'
-$previous = $null
-if ($current -and (Test-OurCommand $current)) {
-    if (Test-File $infoPath) { $previous = (Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json).previousCommand }
+# what to put back on uninstall: the line this replaced, and whether the table is ours
+$old = $null
+if (Test-File $InfoPath) { $old = [IO.File]::ReadAllText($InfoPath, $Utf8) | ConvertFrom-Json }
+if ($current -and (Test-OurCommand $current $(if ($old) { $old.command }))) {
+    $previousLine = $null; $previousCommand = $null; $createdTable = $false
+    if ($old) {
+        if ($old.previousLine -is [string]) { $previousLine = $old.previousLine }
+        if ($old.previousCommand -is [string]) { $previousCommand = $old.previousCommand }
+        $createdTable = $old.createdTable -eq $true
+    }
 } elseif ($current) {
     if (-not $Force) {
         throw "tui.toml already runs another status line command: $current`nRun this installer with -Force to replace it; uninstall.ps1 puts it back."
     }
-    $previous = $current
+    $previousLine = $lines[$cmdLine]; $previousCommand = $current; $createdTable = $false
     Say "Replacing the status line command $current"
+} else {
+    # (explicit $null: an `if` that yields nothing would become {} in 5.1's ConvertTo-Json)
+    $previousLine = $null
+    if ($cmdLine -ge 0) { $previousLine = $lines[$cmdLine] }   # command = "" stays as it was
+    $previousCommand = $null
+    $createdTable = $header -lt 0
 }
 
 $newLine = 'command = "' + $Command + '"'
@@ -279,14 +292,46 @@ else {
     $lines.Add('[status_line]'); $lines.Add($newLine); $lines.Add('')
 }
 $newRaw = $lines -join $nl
+
+# ------------------------------------------------------------------- write ---
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+function Write-Kept([string]$Path, [byte[]]$Bytes) {
+    # writes $Path, first copying an existing different file to <name>.bak-<stamp>
+    if (Test-File $Path) {
+        $was = [IO.File]::ReadAllBytes($Path)
+        if ([Convert]::ToBase64String($was) -eq [Convert]::ToBase64String($Bytes)) { return }
+        Copy-Item -LiteralPath $Path -Destination "$Path.bak-$stamp"
+        Say "Backed up $Path"
+    }
+    [IO.File]::WriteAllBytes($Path, $Bytes)
+}
+
+New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+Write-Kept (Join-Path $AppDir 'statusline.sh') $Utf8.GetBytes($script)
+# jq's path goes in a UTF-8 file that bash reads, as it may hold any characters
+$jqFile = Join-Path $AppDir 'jq-path.txt'
+if ($JqPath) { Write-Kept $jqFile $Utf8.GetBytes($JqPath + "`n") }
+elseif (Test-File $jqFile) { Remove-Item -LiteralPath $jqFile }
+$shim = @(
+    '@echo off'
+    "rem kimi-code-statusline-bash $ver launcher, written by install.ps1. Kimi Code runs"
+    'rem [status_line] command through "cmd.exe /d /s /c"; this starts Git Bash on the'
+    'rem statusline.sh next to it. Run install.ps1 again instead of editing this file.'
+    ('"' + $bashForBatch + '" "%~dp0statusline.sh"')
+)
+Write-Kept $ShimPath ([Text.Encoding]::ASCII.GetBytes(($shim -join "`r`n") + "`r`n"))
+
 if ($newRaw -ne $raw) {
     if (Test-File $TuiPath) { Copy-Item -LiteralPath $TuiPath -Destination "$TuiPath.bak-$stamp"; Say "Backed up $TuiPath" }
     $out = $Utf8.GetBytes($newRaw)
     if ($bom) { $out = [byte[]](0xEF, 0xBB, 0xBF) + $out }
     [IO.File]::WriteAllBytes($TuiPath, $out)
 }
-$info = [ordered]@{ version = $ver; installedAt = (Get-Date).ToString('o'); command = $Command; previousCommand = $previous }
-[IO.File]::WriteAllText($infoPath, ($info | ConvertTo-Json) + "`n", $Utf8)
+$info = [ordered]@{
+    version = $ver; installedAt = (Get-Date).ToString('o'); command = $Command
+    previousCommand = $previousCommand; previousLine = $previousLine; createdTable = $createdTable
+}
+[IO.File]::WriteAllText($InfoPath, ($info | ConvertTo-Json) + "`n", $Utf8)
 Say "tui.toml: [status_line] command = `"$Command`""
 
 # --------------------------------------------------------------- smoke test ---
@@ -310,7 +355,7 @@ $sw.Stop()
 $line = (($outTask.Result -split "`n")[0]).TrimEnd()
 if ($p.HasExited -and $p.ExitCode -eq 0 -and $line) {
     if (-not $Host.UI.SupportsVirtualTerminal) { $line = $line -replace "\x1b\[[0-9;]*m", '' }
-    Say ("Test run ({0} ms): " -f $sw.ElapsedMilliseconds)
+    Say ("Test run ({0} ms):" -f $sw.ElapsedMilliseconds)
     Write-Host "    $line"
     if ($sw.ElapsedMilliseconds -gt 300) { Warn 'That run took over 300 ms, the limit after which Kimi drops a run. A first run is slower; if Kimi keeps showing its own footer, see Troubleshooting in the README.' }
 } else {

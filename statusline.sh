@@ -82,11 +82,13 @@ spawn() { "$BASH" "$0" "$@" </dev/null >/dev/null 2>&1 & }
 
 # ----------------------------------------------------------------- workers ---
 worker_env() {
-  # jq: the one install.ps1 found (KIMI_STATUSLINE_JQ, set by statusline.cmd), since
-  # the shell Kimi spawns may not have the same PATH; otherwise whatever PATH has
+  # jq: KIMI_STATUSLINE_JQ if set, else the one install.ps1 found (jq-path.txt next to this
+  # file; the shell Kimi spawns may not have your PATH), else whatever PATH has
+  local p=${KIMI_STATUSLINE_JQ:-} f="${0%[/\\]*}/jq-path.txt"
+  [[ -z $p && -f $f ]] && IFS= read -r p < "$f"
   JQ=jq
-  if [[ -n ${KIMI_STATUSLINE_JQ:-} ]]; then
-    to_unix "$KIMI_STATUSLINE_JQ"
+  if [[ -n $p ]]; then
+    to_unix "${p%$'\r'}"
     [[ -f $REPLY ]] && JQ=$REPLY
   fi
   mkdir -p "$CACHE_DIR" 2>/dev/null
@@ -118,12 +120,15 @@ if [[ ${1:-} == --refresh ]]; then
 
   # config.toml: base_url + oauth key + api_key of the managed kimi provider
   base=""; okey=""; apikey=""; sec=""; plan=0
+  prov_re=$'^[[:space:]]*\\[[[:space:]]*providers[[:space:]]*\\.[[:space:]]*["\']managed:kimi-code["\'][[:space:]]*(\\.[[:space:]]*oauth[[:space:]]*)?\\]'
   while IFS= read -r l || [[ -n $l ]]; do
-    case $l in
-      \[providers.\"managed:kimi-code\".oauth\]*) sec=oauth; continue;;
-      \[providers.\"managed:kimi-code\"\]*)       sec=prov; plan=1; continue;;
-      \[*)                                        sec="";    continue;;
-    esac
+    [[ $l == *managed:kimi-code* ]] && plan=1
+    if [[ $l =~ $prov_re ]]; then
+      if [[ -n ${BASH_REMATCH[1]} ]]; then sec=oauth; else sec=prov; fi
+      continue
+    elif [[ $l =~ ^[[:space:]]*\[ ]]; then
+      sec=""; continue
+    fi
     if [[ $sec == prov ]]; then
       [[ $l =~ ^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] && base=${BASH_REMATCH[1]}
       [[ $l =~ ^[[:space:]]*api_key[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]  && apikey=${BASH_REMATCH[1]}
@@ -131,7 +136,8 @@ if [[ ${1:-} == --refresh ]]; then
       [[ $l =~ ^[[:space:]]*key[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]      && okey=${BASH_REMATCH[1]}
     fi
   done < "$KHOME/config.toml"
-  # no Kimi Code plan (only other providers' API keys): "-" tells renders to hide the segment
+  # no Kimi Code plan anywhere in config.toml (only other providers' API keys): "-" tells
+  # renders to hide the segment
   if (( ! plan )); then text=- col=90; save_quota $((EPOCHSECONDS + QUOTA_TTL)); exit 0; fi
   [[ -z $base ]] && base="https://api.kimi.com/coding/v1"
 
@@ -254,13 +260,17 @@ if [[ ${1:-} == --scan ]]; then
   declare -A off=() pend=() size=()
   if [[ -f $st ]]; then
     { IFS=$'\t' read -r added removed effort
+      # numbers only: these end up in arithmetic, which would evaluate anything else
       while IFS=$'\t' read -r k a b; do
-        case $k in F) off[$a]=$b;; P) pend[$a]=$b;; esac
+        case $k in
+          F) [[ $b =~ ^[0-9]{1,15}$ ]] && off[$a]=$b;;
+          P) [[ $b =~ ^[0-9]{1,9}:[0-9]{1,9}$ ]] && pend[$a]=$b;;
+        esac
       done
     } < "$st"
   fi
-  [[ $added =~ ^[0-9]+$ ]] || added=0
-  [[ $removed =~ ^[0-9]+$ ]] || removed=0
+  [[ $added =~ ^[0-9]{1,15}$ ]] || added=0
+  [[ $removed =~ ^[0-9]{1,15}$ ]] || removed=0
 
   files=( "$sdir"/agents/*/wire.jsonl )
   [[ -f ${files[0]} ]] || exit 0
@@ -402,8 +412,9 @@ if [[ -n $sid ]]; then
     done
   fi
 fi
-[[ $added =~ ^[0-9]+$ ]] || added=0
-[[ $removed =~ ^[0-9]+$ ]] || removed=0
+[[ $added =~ ^[0-9]{1,15}$ ]] || added=0
+[[ $removed =~ ^[0-9]{1,15}$ ]] || removed=0
+[[ $effort =~ ^[A-Za-z0-9_-]{0,20}$ ]] || effort=
 # the session log has the effort actually in use; config.toml only until it is scanned
 if [[ -z $effort ]]; then config_effort; effort=$REPLY; fi
 [[ $effort == on ]] && effort=thinking        # thinking on, model without effort levels
@@ -450,8 +461,9 @@ fi
 # quota (from cache; refetched by a detached worker when due)
 qnext=0 qok=0 qcol="" qtext=""
 [[ -f $QUOTA_CACHE ]] && IFS=$'\t' read -r qnext qok qcol qtext < "$QUOTA_CACHE"
-[[ $qnext =~ ^[0-9]+$ ]] || qnext=0
-[[ $qok =~ ^[0-9]+$ ]] || qok=0
+[[ $qnext =~ ^[0-9]{1,15}$ ]] || qnext=0
+[[ $qok =~ ^[0-9]{1,15}$ ]] || qok=0
+[[ $qcol =~ ^[0-9]{1,3}$ ]] || qcol=90
 if (( EPOCHSECONDS >= qnext )) && ! lock_busy "$CACHE_DIR/quota.lock"; then spawn --refresh; fi
 if [[ $qtext == - ]]; then
   :                                                   # no Kimi Code plan: nothing to show

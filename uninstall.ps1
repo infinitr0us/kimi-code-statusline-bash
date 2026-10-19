@@ -3,7 +3,7 @@
     Removes kimi-code-statusline-bash from Kimi Code.
 
 .DESCRIPTION
-    Takes the [status_line] command out of <Kimi home>\tui.toml, or puts back the command
+    Takes the [status_line] command out of <Kimi home>\tui.toml, or puts back the line
     that install.ps1 -Force replaced, then deletes the installed files and the status
     line's cache. Backups made by install.ps1 stay where they are. <Kimi home> is
     KIMI_CODE_HOME, else ~\.kimi-code.
@@ -32,10 +32,39 @@ if (-not $KimiHome) {
 $KimiHome = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KimiHome).TrimEnd('\')
 if (-not (Test-Path -LiteralPath $KimiHome -PathType Container)) { throw "Kimi Code's home folder $KimiHome does not exist." }
 $AppDir = Join-Path $KimiHome 'statusline-bash'
+$ShimPath = Join-Path $AppDir 'statusline.cmd'
 $TuiPath = Join-Path $KimiHome 'tui.toml'
-$infoPath = Join-Path $AppDir 'install.json'
-$previous = $null
-if (Test-File $infoPath) { $previous = (Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json).previousCommand }
+$InfoPath = Join-Path $AppDir 'install.json'
+$info = $null
+if (Test-File $InfoPath) { $info = [IO.File]::ReadAllText($InfoPath, $Utf8) | ConvertFrom-Json }
+
+# the same TOML reading and launcher test as install.ps1
+$Command = ($ShimPath -replace '\\', '/') -replace '([ &|<>^(),;=])', '^$1'
+$TableRe = '^\s*\[\s*(?:status_line|"status_line"|''status_line'')\s*\]\s*(?:#.*)?$'
+$KeyRe = '^\s*(?:command|"command"|''command'')\s*='
+function Get-TomlCommand([string]$Line) {
+    $m = [regex]::Match($Line, $KeyRe + '\s*(?:"((?:[^"\\]|\\.)*)"|''([^'']*)'')\s*(?:#.*)?$')
+    if (-not $m.Success) { return $null }
+    if ($m.Groups[2].Success) { return $m.Groups[2].Value }
+    [regex]::Replace($m.Groups[1].Value, '\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)', [Text.RegularExpressions.MatchEvaluator] {
+        param($e)
+        $c = $e.Groups[1].Value
+        $k = $c.Substring(0, 1)
+        if ($k -ceq 'u') { return [string][char][Convert]::ToInt32($c.Substring(1), 16) }
+        if ($k -ceq 'U') { return [char]::ConvertFromUtf32([Convert]::ToInt32($c.Substring(1), 16)) }
+        if ($k -ceq 'b') { return [string][char]8 }
+        if ($k -ceq 't') { return "`t" }
+        if ($k -ceq 'n') { return "`n" }
+        if ($k -ceq 'f') { return [string][char]12 }
+        if ($k -ceq 'r') { return "`r" }
+        return $c
+    })
+}
+function Test-OurCommand([string]$Value, [string]$Recorded) {
+    $plain = { param($s) ($s -replace '\^(.)', '$1' -replace '\\', '/').Trim() }
+    $v = & $plain $Value
+    ($v -ieq (& $plain $Command)) -or ($Recorded -and $v -ieq (& $plain $Recorded))
+}
 
 # ----------------------------------------------------------------- tui.toml ---
 if (Test-File $TuiPath) {
@@ -47,25 +76,30 @@ if (Test-File $TuiPath) {
     $lines.AddRange([string[]]($raw -split "`r?`n"))
 
     $header = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[\s*status_line\s*\]\s*(#.*)?$') { $header = $i; break } }
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match $TableRe) { $header = $i; break } }
     $cmdLine = -1
     $end = $lines.Count
     if ($header -ge 0) {
         for ($i = $header + 1; $i -lt $lines.Count; $i++) {
             if ($lines[$i] -match '^\s*\[') { $end = $i; break }
-            if ($cmdLine -lt 0 -and $lines[$i] -match '^\s*command\s*=') { $cmdLine = $i }
+            if ($cmdLine -lt 0 -and $lines[$i] -match $KeyRe) { $cmdLine = $i }
         }
     }
-    $ours = $cmdLine -ge 0 -and ($lines[$cmdLine] -replace '\^', '' -replace '\\\\', '/') -imatch '/statusline-bash/statusline\.cmd"'
-    if ($ours) {
-        if ($previous) {
-            $lines[$cmdLine] = 'command = "' + ($previous -replace '\\', '\\' -replace '"', '\"') + '"'
-            Say "tui.toml: put back the earlier status line command $previous"
+    $current = if ($cmdLine -ge 0) { Get-TomlCommand $lines[$cmdLine] }
+    if ($null -ne $current -and (Test-OurCommand $current $(if ($info) { $info.command }))) {
+        $previousLine = $null
+        if ($info -and $info.previousLine -is [string]) { $previousLine = $info.previousLine }
+        if (-not $previousLine -and $info -and $info.previousCommand -is [string] -and $info.previousCommand) {   # install.json from before previousLine
+            $previousLine = 'command = "' + ($info.previousCommand -replace '\\', '\\' -replace '"', '\"') + '"'
+        }
+        if ($previousLine) {
+            $lines[$cmdLine] = $previousLine
+            Say "tui.toml: put back $($previousLine.Trim())"
         } else {
             $lines.RemoveAt($cmdLine); $end--
-            # drop the [status_line] header too if nothing but blanks and comments is left under it
-            $empty = $true
-            for ($i = $header + 1; $i -lt $end; $i++) { if ($lines[$i] -notmatch '^\s*(#.*)?$') { $empty = $false; break } }
+            # drop the [status_line] table too if install.ps1 added it and nothing else is in it now
+            $empty = $info -and $info.createdTable -eq $true
+            for ($i = $header + 1; $empty -and $i -lt $end; $i++) { if ($lines[$i] -notmatch '^\s*(#.*)?$') { $empty = $false } }
             if ($empty) { $lines.RemoveRange($header, $end - $header) }
             Say 'tui.toml: removed the status line command; Kimi Code shows its own footer again'
         }
@@ -81,7 +115,7 @@ if (Test-File $TuiPath) {
 }
 
 # -------------------------------------------------------------------- files ---
-foreach ($name in 'statusline.sh', 'statusline.cmd', 'install.json') {
+foreach ($name in 'statusline.sh', 'statusline.cmd', 'jq-path.txt', 'install.json') {
     $p = Join-Path $AppDir $name
     if (Test-File $p) { Remove-Item -LiteralPath $p -Force }
 }

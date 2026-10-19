@@ -29,5 +29,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $assets = (Get-ChildItem dist -File | Where-Object Name -ne 'NOTES.md').FullName
-          $extra = if ($env:TAG.Contains('-')) { @('--prerelease') } else { @() }
+          $extra = @(if ($env:TAG.Contains('-')) { '--prerelease' })
           gh release create $env:TAG @assets --title $env:TAG --notes-file dist/NOTES.md --verify-tag @extra
