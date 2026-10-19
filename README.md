@@ -1,12 +1,16 @@
 # kimi-code-statusline-bash
 
+English | [中文](README.zh-CN.md)
+
 A Claude Code style status line for [Kimi Code](https://www.kimi.com/code) on Windows. It replaces the first line of Kimi Code's footer with the things worth a glance while you work: the permission mode, model and thinking effort, folder, git branch, your plan quota, and how long the session has run and how many lines it changed.
+
+![The status line under Kimi Code's input box](assets/screenshot.png)
+
+Inside a git repository and once a session has started, the branch and the session's time and changed lines join in:
 
 ```text
 Ask When Needed | K3 · max | ~/Desktop/proj | main | 5h 5% (rst 00:34) · 7d 52% (rst 10/25 23:34) | 1h23m +120/-45
 ```
-
-In the terminal, each part also has its own color and a Nerd Font icon.
 
 It is one bash script, run by the bash that comes with Git for Windows. There is nothing to compile, and you can read and change all of it.
 
@@ -48,7 +52,7 @@ This installs the latest release. For a particular release:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/infinitr0us/kimi-code-statusline-bash/main/install.ps1))) -Version v0.1.0
 ```
 
-You can also download `kimi-code-statusline-bash-<version>.zip` from [Releases](https://github.com/infinitr0us/kimi-code-statusline-bash/releases), unzip it, read the scripts, and run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in that folder.
+You can also download `kimi-code-statusline-bash-<version>.zip` from [Releases](https://github.com/infinitr0us/kimi-code-statusline-bash/releases), unzip it, read the scripts, and run `powershell -ExecutionPolicy Bypass -File .\install.ps1` in that folder. Installing from the zip needs no network access.
 
 ### What the installer changes
 

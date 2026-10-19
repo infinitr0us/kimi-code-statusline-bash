@@ -34,9 +34,11 @@ $sh = [IO.File]::ReadAllText((Join-Path $repo 'statusline.sh')) -replace "`r`n",
 if ($sh -notmatch '(?m)^KSL_VERSION=dev ') { throw 'statusline.sh has no KSL_VERSION=dev line to stamp.' }
 $sh = $sh -replace '(?m)^KSL_VERSION=dev ', "KSL_VERSION=$Tag "
 [IO.File]::WriteAllText((Join-Path $pkg 'statusline.sh'), $sh, $utf8)
-foreach ($f in 'install.ps1', 'uninstall.ps1', 'README.md', 'CHANGELOG.md', 'LICENSE') {
+foreach ($f in 'install.ps1', 'uninstall.ps1', 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'LICENSE') {
     Copy-Item -LiteralPath (Join-Path $repo $f) -Destination $pkg
 }
+New-Item -ItemType Directory -Path (Join-Path $pkg 'assets') | Out-Null
+Copy-Item -LiteralPath (Join-Path $repo 'assets\screenshot.png') -Destination (Join-Path $pkg 'assets')   # the READMEs show it
 
 Compress-Archive -Path $pkg -DestinationPath (Join-Path $dist "$name.zip")
 foreach ($f in 'statusline.sh', 'install.ps1', 'uninstall.ps1') { Copy-Item -LiteralPath (Join-Path $pkg $f) -Destination $dist }
