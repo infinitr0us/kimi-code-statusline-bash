@@ -2,14 +2,14 @@
 
 English | [中文](README.zh-CN.md)
 
-A Claude Code style status line for [Kimi Code](https://www.kimi.com/code) on Windows. It replaces the first line of Kimi Code's footer with the things worth a glance while you work: the permission mode, model and thinking effort, folder, git branch, your plan quota, and how long the session has run and how many lines it changed.
+A Claude Code style status line for [Kimi Code](https://www.kimi.com/code) on Windows. It replaces the first line of Kimi Code's footer with the things worth a glance while you work: the permission mode, model and thinking effort, folder, git branch, your plan quota, how long the session has run and how many lines it changed, and between turns, how long the server still keeps your prompt cache.
 
 ![The status line under Kimi Code's input box](assets/screenshot.png)
 
-Inside a git repository and once a session has started, the branch and the session's time and changed lines join in:
+Inside a git repository and once a session has started, the branch, the session's time and changed lines, and the cache countdown join in:
 
 ```text
-Ask When Needed | K3 · max | ~/Desktop/proj | main | 5h 5% (rst 00:34) · 7d 52% (rst 10/25 23:34) | 1h23m +120/-45
+Ask When Needed | K3 · max | ~/Desktop/proj | main | 5h 5% · 3h41m · 7d 52% · Sat 23:34 | 1h23m +120/-45 | 24m
 ```
 
 It is one bash script, run by the bash that comes with Git for Windows. There is nothing to compile, and you can read and change all of it.
@@ -24,16 +24,17 @@ It is one bash script, run by the bash that comes with Git for Windows. There is
 | Model | model and thinking effort | The effort comes from the session's log (the one really in use), or from `config.toml` until the session has one. |
 | Folder | working folder | `~` stands for your user folder; long paths keep their last three folders. |
 | Git | current branch | Hidden outside a git repository. |
-| Quota | 5-hour and 7-day use of your Kimi Code plan, with reset times | Green below 60%, yellow below 85%, red above. Refreshed every 5 minutes in the background and greyed out when the last refresh is over 15 minutes old. Hidden if you use Kimi Code without a Kimi Code plan. |
+| Quota | 5-hour and 7-day use of your Kimi Code plan: the time left until the 5-hour window resets, and the day and time the week resets | Green below 60%, yellow below 85%, red above. Refreshed every 5 minutes in the background (and right after a window resets) and greyed out when the last refresh is over 15 minutes old. Hidden if you use Kimi Code without a Kimi Code plan. |
 | Session | time since the session started, lines added and removed | Counts the Edit and Write tool calls that succeeded, sub-agents included, as a line diff. |
+| Prompt cache | between turns, the minutes until the server drops the session's prompt cache | After each model call, Kimi Code's server keeps the conversation cached for a while: by Kimi Code's own estimate, which it also uses for its "cache expired" prompt, currently 30 minutes for K3 and K3.1 Pro and 60 for Kimi for Coding. Blue, yellow in the last 5 minutes, then `cold`: the next message has the whole conversation read again, which is slower and costs more of your quota. Also `cold` right after you switch to another model, which has no cache of this conversation. Hidden while a turn runs (every model call refreshes the cache) unless the cache has expired anyway, and for models Kimi Code has no estimate for. |
 
-Context use is left out because Kimi Code's second footer line already shows it.
+Context use is left out because Kimi Code's second footer line already shows it. Kimi Code shows a status line command's output instead of its own first footer line, so that line's goal and running-task badges (Kimi Code 2.3) don't appear; Kimi Code doesn't pass them to the command.
 
 ## Requirements
 
 - Windows 10 or 11 with [Kimi Code](https://www.kimi.com/code). Tested with Kimi Code 2.2.0.
 - [Git for Windows](https://git-scm.com/download/win), for its bash 5: `winget install Git.Git`
-- [jq](https://jqlang.org), for the quota, thinking effort and changed lines: `winget install jqlang.jq`. Without it, those parts stay empty.
+- [jq](https://jqlang.org), for the quota, thinking effort, changed lines and cache countdown: `winget install jqlang.jq`. Without it, those parts stay empty.
 - A [Nerd Font](https://www.nerdfonts.com) as your terminal's font, for the icons.
 
 ## Install
@@ -92,13 +93,14 @@ About once a second, Kimi Code runs the `[status_line]` command with a JSON snap
 
 In Git Bash, each program started costs tens of milliseconds, so a render uses only bash builtins and takes about 50 ms. The slow work runs in background processes, which leave their results in `.kimi-code\cache\statusline` for later renders:
 
-- every 5 minutes, one fetches the quota from Kimi Code's usage API (curl and jq);
-- when a session's log has grown, one reads the new records for changed lines and the thinking effort (jq). An idle session costs nothing.
+- every 5 minutes, one fetches the quota from Kimi Code's usage API (curl and jq), and once a day the prompt-cache durations that Kimi Code itself uses;
+- when a session's log has grown, one reads the new records for changed lines, the thinking effort, the time of the last model call and whether a turn is running (jq). An idle session costs nothing.
 
 ## Privacy and security
 
 - For the quota, the script reads the login token that Kimi Code keeps in `.kimi-code\credentials\` (or the API key in `config.toml`) and sends it only to the Kimi Code provider's own `base_url` (by default `https://api.kimi.com/coding/v1/usages`). The token reaches curl through stdin, so it never shows up in a process list. The script never refreshes or writes your credentials; while the token is expired, it waits for Kimi Code to refresh it.
-- Session logs are only read locally, to count changed lines. Nothing else leaves your computer.
+- The prompt-cache durations come from the same server (`<base_url>/client_configs`, a public setting), fetched without your token. If that fails, the script reads Kimi Code's own copy in `.kimi-code\cache\client-configs\`.
+- Session logs are only read locally, to count changed lines and time the prompt cache. Nothing else leaves your computer.
 - Apart from a temporary download, the installer writes only inside Kimi Code's home folder.
 
 ## Troubleshooting
@@ -114,6 +116,8 @@ Measure-Command { '{"model":"K3","permissionMode":"yolo"}' | & "$HOME\.kimi-code
 **The quota shows `…`, `?`, or is grey.** `…` means the first fetch hasn't finished yet. `?` or grey means fetching fails: check that you are logged in to Kimi Code with a Kimi Code plan and that jq is installed. A token that expired while Kimi Code sat idle is refreshed the next time Kimi Code talks to its server.
 
 **No thinking effort or changed lines.** jq is missing. Install it (`winget install jqlang.jq`) and run the installer again.
+
+**No cache countdown.** It shows between turns once the session has made a model call, for the models of a Kimi Code plan. It also needs jq. It can take a second or two after a turn ends to appear.
 
 **A part looks wrong after a Kimi Code update.** The script reads files and an API that Kimi Code doesn't document (session logs, the usage endpoint), and an update can change them. Please [open an issue](https://github.com/infinitr0us/kimi-code-statusline-bash/issues) with your Kimi Code version (`kimi --version`).
 

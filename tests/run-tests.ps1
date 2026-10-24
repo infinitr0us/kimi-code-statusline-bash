@@ -23,8 +23,10 @@ $Esc = [char]27
 $G = @{   # the Nerd Font icons statusline.sh prints (this file stays ASCII)
     model = [char]::ConvertFromUtf32(0xF06A9); dir = [char]::ConvertFromUtf32(0xF024B)
     git = [char]::ConvertFromUtf32(0xF02A2); quota = [char]::ConvertFromUtf32(0xF0A9E)
-    session = [char]::ConvertFromUtf32(0xF19BB); dot = [string][char]0xB7; ellipsis = [string][char]0x2026
+    session = [char]::ConvertFromUtf32(0xF19BB); cache = [string][char]0xF1C0
+    dot = [string][char]0xB7; ellipsis = [string][char]0x2026
 }
+$Days = 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'
 $script:Passed = 0
 $script:Failed = 0
 $script:Times = New-Object System.Collections.Generic.List[double]
@@ -48,6 +50,8 @@ function Wait-Until([scriptblock]$Condition, [int]$Seconds = 20) {
     [bool](& $Condition)
 }
 function Read-Text([string]$Path) { if (Test-Path -LiteralPath $Path) { [IO.File]::ReadAllText($Path) } else { '' } }
+function ConvertTo-MsysPath([string]$Path) { '/' + $Path.Substring(0, 1).ToLower() + ($Path.Substring(2) -replace '\\', '/') }
+function Get-EpochMs([double]$MinutesAgo = 0) { [DateTimeOffset]::UtcNow.AddMinutes(-$MinutesAgo).ToUnixTimeMilliseconds() }
 
 $Pwsh = (Get-Process -Id $PID).Path   # run the installers with the same PowerShell as the tests
 # (Continue: under Windows PowerShell 5.1 a child's stderr would otherwise stop the tests)
@@ -61,6 +65,18 @@ function Invoke-Command64([string]$Command) {   # a -Command run without quoting
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
     $out = & $Pwsh -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc 2>&1 | Out-String
     [pscustomobject]@{ Code = $LASTEXITCODE; Output = $out }
+}
+
+# Renders about once a second, as Kimi Code does, until $Ok accepts one (or 20 s pass):
+# right after a log grows, a render may still wait for the background scan.
+function Wait-Render([string]$KimiHome, [string]$Sid, [scriptblock]$Ok) {
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        $o = Invoke-Render $KimiHome -Sid $Sid
+        if (& $Ok $o) { break }
+        Start-Sleep -Milliseconds 700
+    } while ((Get-Date) -lt $deadline)
+    $o
 }
 
 function Get-Command-From-Tui([string]$KimiHome) {
@@ -126,6 +142,30 @@ function Tool-Result([string]$Id, [string]$Output, [bool]$IsError = $false) {
     Get-Record ([ordered]@{ type = 'context.append_loop_event'; event = [ordered]@{ type = 'tool.result'; toolCallId = $Id; result = $r } })
 }
 function Effort-Record([string]$Effort) { Get-Record ([ordered]@{ type = 'config.update'; modelAlias = 'kimi-code/k3'; thinkingEffort = $Effort; time = 1 }) }
+# a turn's boundaries and one model call, as Kimi Code 2.3 logs them
+function Turn-Start([int]$Id) {
+    (Get-Record ([ordered]@{ turnId = $Id; queueItemId = "msg_$Id"; type = 'agent.turn.started'; time = (Get-EpochMs); kind = 'event' })) +
+    (Get-Record ([ordered]@{ type = 'turn.prompt'; agentId = 'main'; promptId = "msg_$Id"; turnId = $Id; time = (Get-EpochMs) }))
+}
+function Turn-End([int]$Id) {
+    (Get-Record ([ordered]@{ turnId = $Id; outcome = 'done'; type = 'agent.turn.ended'; time = (Get-EpochMs); kind = 'event' })) +
+    (Get-Record ([ordered]@{ type = 'turn.ended'; agentId = 'main'; turnId = $Id; reason = 'completed'; time = (Get-EpochMs) }))
+}
+function Model-Request([string]$Model, [double]$MinutesAgo = 0) {
+    Get-Record ([ordered]@{ type = 'llm.request'; agentId = 'main'; kind = 'loop'; provider = 'openai'; model = $Model; modelAlias = "kimi-code/$Model"; time = (Get-EpochMs $MinutesAgo) })
+}
+function Model-Call([double]$MinutesAgo, [string]$Model = 'k3') {   # a request and its completion
+    (Model-Request $Model $MinutesAgo) +
+    (Get-Record ([ordered]@{ type = 'usage.record'; agentId = 'main'; model = "kimi-code/$Model"; usage = [ordered]@{ inputOther = 1; output = 2; inputCacheRead = 3; inputCacheCreation = 0 }; usageScope = 'turn'; time = (Get-EpochMs $MinutesAgo) }))
+}
+function Model-Switch([string]$Model) {   # /model while idle
+    Get-Record ([ordered]@{ type = 'config.update'; modelAlias = "kimi-code/$Model"; thinkingEffort = 'high'; time = (Get-EpochMs) })
+}
+# Kimi Code's own cached copy of the prompt-cache rules (cache\client-configs)
+function Write-KimiCacheRules([string]$KimiHome, [int]$Seconds) {
+    Write-Text (Join-Path $KimiHome 'cache\client-configs\global%3A%2Fclient_configs%3Aestimated_cache_duration.json') (
+        '{"version":1,"fetchedAt":1,"config":{"version":1,"config":{"k3":{"min_tokens_to_hint":200000,"cache_duration":' + $Seconds + '}}}}')
+}
 
 $KimiDefaultTui = @"
 # ~/.kimi-code/tui.toml
@@ -167,6 +207,7 @@ try {
     Write-Host 'install'
     # a space, & and ( ) in the path: install.ps1 must ^-escape them for cmd
     $A = New-KimiHome 'kimi home (A) & co' -BaseUrl $BaseUrl -Tui $KimiDefaultTui
+    Write-KimiCacheRules $A 1800   # used only without the mock server
     $r = Invoke-Script (Join-Path $Repo 'install.ps1') @('-KimiHome', $A)
     Check 'install.ps1 succeeds' ($r.Code -eq 0) $r.Output
     $app = Join-Path $A 'statusline-bash'
@@ -242,17 +283,53 @@ try {
     $o = Invoke-Render $A -Sid $sid
     Check 'changed lines +12/-7' ($o.Text -match '\+12/-7$') $o.Text
 
+    # A long run of emoji (jq miscounts its bytes) must not push the read position into the
+    # next record. Written by hand: Windows PowerShell's ConvertTo-Json would escape them.
+    $emoji = [char]::ConvertFromUtf32(0x1F600) * 3000
+    Add-Text $main ('{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Write","toolCallId":"c7","args":{"path":"e.txt","content":"' + $emoji + '\n"}}}' + "`n" +
+        (Tool-Result 'c7' 'Wrote e.txt'))                                                           # +1
+    Invoke-Render $A -Sid $sid | Out-Null
+    Wait-Until { (Read-Text $state).StartsWith("13`t7`tmax`n") } | Out-Null
+    Add-Text $main ((Edit-Call 'c8' 'g' 'h') + (Tool-Result 'c8' 'Replaced 1 occurrence'))          # +1 -1
+    Invoke-Render $A -Sid $sid | Out-Null
+    Check 'a record after a long run of emoji is still read' (Wait-Until { (Read-Text $state).StartsWith("14`t8`tmax`n") }) (Read-Text $state)
+
     # ------------------------------------------------------------------- quota ---
     Write-Host 'quota'
     $quota = Join-Path $A 'cache\statusline\quota'
     if ($Python) {
         Invoke-Render $A | Out-Null
-        $ok = Wait-Until { (Read-Text $quota) -match "`t92`t5h 5%" }
+        $ok = Wait-Until { (Read-Text $quota) -match "`t92`tq`t5`t\d+`t52`t\d+`t-`n" }
         Check 'quota fetched in the background' $ok (Read-Text $quota)
         $o = Invoke-Render $A
-        $want = [regex]::Escape("$($G.quota) 5h 5% (rst ") + '\d\d:\d\d\) ' + [regex]::Escape("$($G.dot) 7d 52% (rst ") + '\d\d/\d\d \d\d:\d\d\)'
-        Check 'quota part' ($o.Text -match $want) $o.Text
+        $f = (Read-Text $quota).Split("`t")
+        $left = [math]::Ceiling(([long]$f[5] - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) / 60)
+        $leftText = @($left, ($left + 1) | ForEach-Object { '{0}h{1:00}m' -f [math]::Floor($_ / 60), ($_ % 60) })   # rendered a moment earlier
+        $reset = [DateTimeOffset]::FromUnixTimeSeconds([long]$f[7]).ToLocalTime()
+        $want = "$($G.quota) 5h 5% $($G.dot) <left> $($G.dot) 7d 52% $($G.dot) $($Days[[int]$reset.DayOfWeek]) $($reset.ToString('HH:mm'))"
+        Check 'quota part: time left in 5 hours, the week''s reset in local time' (
+            $o.Text.Contains($want.Replace('<left>', $leftText[0])) -or $o.Text.Contains($want.Replace('<left>', $leftText[1]))) "$($o.Text) / want $want, <left> = $($leftText -join ' or ')"
         Check 'quota colored green under 60%' ($o.Raw.Contains("$Esc[92m$($G.quota) 5h")) $o.Raw
+
+        # a quota cache written by v0.1.0 (text): refetched at once, "..." until then
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        Write-Text $quota ("$($now + 300)`t$now`t92`t5h 5% (rst 00:34) $($G.dot) 7d 52% (rst 10/25 23:34)`n")
+        $o = Invoke-Render $A
+        Check 'quota cache in the old format: not shown as numbers' ($o.Text.Contains("$($G.quota) $($G.ellipsis)")) $o.Text
+        Check '... and refetched right away' (Wait-Until { (Read-Text $quota) -match "`tq`t5`t" }) (Read-Text $quota)
+
+        # the week only: no 5-hour numbers, and the week's not shifted into their place
+        $Wk = New-KimiHome 'weekly only' -BaseUrl "http://127.0.0.1:$Port/weekly/coding/v1" -Tui ''
+        Invoke-Script (Join-Path $Repo 'install.ps1') @('-KimiHome', $Wk) | Out-Null
+        Check 'a report with the week only' (Wait-Until { (Read-Text "$Wk\cache\statusline\quota") -match "`tq`t-`t-`t52`t\d+`t-`n" }) (Read-Text "$Wk\cache\statusline\quota")
+        $o = Invoke-Render $Wk
+        Check '... shows the week only' ($o.Text -match ([regex]::Escape("$($G.quota) 7d 52% $($G.dot) ") + '[A-Z][a-z]{2} \d\d:\d\d') -and -not $o.Text.Contains('5h')) $o.Text
+        # a 5-hour window that resets this very second: fetched again 5 s later
+        $Sn = New-KimiHome 'reset now' -BaseUrl "http://127.0.0.1:$Port/now/coding/v1" -Tui ''
+        Invoke-Script (Join-Path $Repo 'install.ps1') @('-KimiHome', $Sn) | Out-Null
+        Wait-Until { (Read-Text "$Sn\cache\statusline\quota") -match "`tq`t5`t" } | Out-Null
+        $f = (Read-Text "$Sn\cache\statusline\quota").Split("`t")
+        Check 'a window that resets before the next fetch: fetched again 5 s after the reset' ($f.Count -ge 6 -and [long]$f[0] -eq [long]$f[5] + 5) (Read-Text "$Sn\cache\statusline\quota")
     } else { Skip 'quota fetch' 'no Python for the mock server' }
     # also: a jq in a folder with a non-ASCII name (its path goes into jq-path.txt, as UTF-8)
     $jqCopy = $null
@@ -281,6 +358,88 @@ try {
     Check 'no Kimi Code plan: quota marked as none' $ok (Read-Text (Join-Path $N 'cache\statusline\quota'))
     $o = Invoke-Render $N
     Check '... and not shown' ($o.Code -eq 0 -and $o.Text -and -not $o.Text.Contains($G.quota)) $o.Text
+    Check '... nor the prompt-cache rules fetched' (-not (Test-Path -LiteralPath "$N\cache\statusline\cache-rules"))
+
+    # ------------------------------------------------------------ prompt cache ---
+    Write-Host 'prompt cache'
+    $rules = Join-Path $A 'cache\statusline\cache-rules'
+    Check 'cache rules fetched with the quota' (Wait-Until { (Read-Text $rules) -match "(?m)^k3`t1800$" }) (Read-Text $rules)
+    if ($Python) {
+        Check '... from the server' ((Read-Text $rules) -match "^[1-9]\d*`n" -and (Read-Text $rules) -match "(?m)^kimi-for-coding`t3600$") (Read-Text $rules)
+    } else { Skip 'cache rules from the server' 'no Python for the mock server' }
+    $csid = 'session_cache'
+    $csdir = Join-Path $A "sessions\wd_test_000000000000\$csid"
+    Write-Text "$csdir\state.json" ('{"createdAt":' + (Get-EpochMs 30) + '}')
+    $cmain = "$csdir\agents\main\wire.jsonl"
+    $cstate = Join-Path $A "cache\statusline\$csid.state"
+    Write-Text $cmain ((Get-Record ([ordered]@{ type = 'metadata'; protocol_version = '1.5'; created_at = (Get-EpochMs 30) })) +
+        (Turn-Start 0) + (Model-Call 10.2) + (Turn-End 0))
+    # K line: last model call (epoch, model, alias), in a turn, the alias selected now, and
+    # the last request (alias, model)
+    function Get-KPattern([string]$Busy, [string]$Model, [string]$Cur = "kimi-code/$Model") {
+        "(?m)^K`t\d+`t$Busy`t" + [regex]::Escape("$Model`tkimi-code/$Model`t$Cur`t") + '\S+\t\S+$'
+    }
+    $cacheEnd = { param([string]$Text, [int]$Color = 34) "$Esc[$($Color)m$($G.cache) $Text$Esc[0m" }
+    Invoke-Render $A -Sid $csid | Out-Null
+    Check 'the scan records the last model call, the turn state and the model' (Wait-Until { (Read-Text $cstate) -match (Get-KPattern 0 'k3') }) (Read-Text $cstate)
+    $want = & $cacheEnd '20m'
+    $o = Wait-Render $A $csid { param($o) $o.Raw.EndsWith($want) }
+    Check 'between turns: minutes left on the cache, in blue, at the end' ($o.Raw.EndsWith($want)) $o.Text
+
+    Add-Text $cmain (Model-Switch 'kimi-for-coding')
+    $want = & $cacheEnd 'cold' 33
+    $o = Wait-Render $A $csid { param($o) $o.Raw.EndsWith($want) }
+    Check 'another model selected (/model): "cold"' ($o.Raw.EndsWith($want)) "$($o.Text) / $(Read-Text $cstate)"
+    Add-Text $cmain (Model-Switch 'k3')
+    $want = & $cacheEnd '20m'
+    $o = Wait-Render $A $csid { param($o) $o.Raw.EndsWith($want) }
+    Check '... and back to the first model: the countdown again' ($o.Raw.EndsWith($want)) "$($o.Text) / $(Read-Text $cstate)"
+
+    Add-Text $cmain (Turn-Start 1)
+    $o = Invoke-Render $A -Sid $csid
+    Check 'hidden as soon as the log grows (a turn is likely running)' (-not $o.Text.Contains($G.cache)) $o.Text
+    Wait-Until { (Read-Text $cstate) -match (Get-KPattern 1 'k3') } | Out-Null
+    $o = Invoke-Render $A -Sid $csid
+    Check '... and while the turn runs' ((Read-Text $cstate) -match "(?m)^K`t\d+`t1`t" -and -not $o.Text.Contains($G.cache)) "$($o.Text) / $(Read-Text $cstate)"
+    Add-Text $cmain ((Model-Request 'kimi-for-coding') + (Turn-End 1))   # stopped before it completed
+    $want = & $cacheEnd 'cold' 33
+    $o = Wait-Render $A $csid { param($o) $o.Raw.EndsWith($want) }
+    Check "a request to another model that never completed: `"cold`", not that model's time" ($o.Raw.EndsWith($want) -and (Read-Text $cstate) -match (Get-KPattern 0 'k3' 'kimi-code/kimi-for-coding')) "$($o.Text) / $(Read-Text $cstate)"
+
+    Add-Text $cmain ((Turn-Start 2) + (Model-Call 28) + (Turn-End 2))   # (an older call, to get near the end)
+    $want = & $cacheEnd '2m' 33
+    $o = Wait-Render $A $csid { param($o) $o.Raw.EndsWith($want) }
+    Check 'yellow in the last 5 minutes' ($o.Raw.EndsWith($want)) "$($o.Text) / $(Read-Text $cstate)"
+    # a duration with a leading zero (bash would read 03600 as octal 1920): not used
+    $rulesText = Read-Text $rules
+    Write-Text $rules ($rulesText -replace "(?m)^k3`t1800$", "k3`t03600")
+    $o = Invoke-Render $A -Sid $csid
+    Check 'a cache rule with a leading zero is ignored' ($o.Code -eq 0 -and -not $o.Text.Contains($G.cache)) $o.Text
+    Write-Text $rules $rulesText
+
+    Add-Text $cmain ((Turn-Start 3) + (Model-Call 31))
+    Invoke-Render $A -Sid $csid | Out-Null
+    Wait-Until { (Read-Text $cstate) -match (Get-KPattern 1 'k3') } | Out-Null
+    $o = Invoke-Render $A -Sid $csid
+    Check 'expired: "cold", even during a turn' ($o.Raw.EndsWith((& $cacheEnd 'cold' 33))) $o.Text
+
+    Add-Text $cmain ((Model-Call 1 'unknown-model') + (Turn-End 3))
+    Invoke-Render $A -Sid $csid | Out-Null
+    Wait-Until { (Read-Text $cstate) -match (Get-KPattern 0 'unknown-model') } | Out-Null
+    $o = Invoke-Render $A -Sid $csid
+    Check 'no rule for the model: no countdown' ($o.Code -eq 0 -and $o.Text -and -not $o.Text.Contains($G.cache)) $o.Text
+
+    # a state written by v0.1.0 (no K line, everything already read): the logs are read again
+    $size = (Get-Item -LiteralPath $cmain).Length
+    Write-Text $cstate ("3`t4`tmax`nF`t" + (ConvertTo-MsysPath $cmain) + "`t$size`n")
+    (Get-Item -LiteralPath $cstate).LastWriteTime = (Get-Date).AddMinutes(-5)
+    Invoke-Render $A -Sid $csid | Out-Null
+    Check 'a state from v0.1.0 is rebuilt from the whole log' (Wait-Until { (Read-Text $cstate) -match "^0`t0`thigh`n" -and (Read-Text $cstate) -match (Get-KPattern 0 'unknown-model') }) (Read-Text $cstate)
+    $size =(Get-Item -LiteralPath $cmain).Length
+    Write-Text $cstate ("0`t0`thigh`nK`t1`t0`tk3`nF`t" + (ConvertTo-MsysPath $cmain) + "`t$size`n")
+    (Get-Item -LiteralPath $cstate).LastWriteTime = (Get-Date).AddMinutes(-5)
+    Invoke-Render $A -Sid $csid | Out-Null
+    Check '... and so is one with a K line it cannot read' (Wait-Until { (Read-Text $cstate) -match (Get-KPattern 0 'unknown-model') }) (Read-Text $cstate)
 
     # --------------------------------------------------------------- uninstall ---
     Write-Host 'uninstall'
@@ -349,13 +508,13 @@ try {
 
     # ---------------------------------------------------------------- hardening ---
     Write-Host 'hardening'
-    $D = New-KimiHome 'kimiD' -Tui ''
+    $D = New-KimiHome 'kimiD' -Tui ''   # no usage API: every fetch fails
+    Write-KimiCacheRules $D 1200
     Invoke-Script $install @('-KimiHome', $D) | Out-Null
     $dsid = 'session_d'
     $dsdir = "$D\sessions\wd_d\$dsid"
     Write-Text "$dsdir\state.json" ('{"createdAt":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + '}')
     Write-Text "$dsdir\agents\main\wire.jsonl" ((Edit-Call 'd1' 'a' 'b') + (Tool-Result 'd1' 'Replaced 1 occurrence'))
-    function ConvertTo-MsysPath([string]$Path) { '/' + $Path.Substring(0, 1).ToLower() + ($Path.Substring(2) -replace '\\', '/') }
     $proof = Join-Path $Root 'proof'
     $dstate = "$D\cache\statusline\$dsid.state"
     # an offset that bash arithmetic would evaluate: a[$(...)] runs the command substitution
@@ -364,13 +523,27 @@ try {
     Invoke-Render $D -Sid $dsid | Out-Null
     $ok = Wait-Until { (Read-Text $dstate).StartsWith("1`t1`t") }
     Check 'a tampered session cache is not evaluated' ($ok -and -not (Test-Path -LiteralPath $proof)) (Read-Text $dstate)
+    $drules = "$D\cache\statusline\cache-rules"
+    Check "server unreachable: Kimi Code's own copy of the cache rules, fetched again next time" (Wait-Until { (Read-Text $drules) -ceq "0`nk3`t1200`n" }) (Read-Text $drules)
+    Check '... and the quota marked as failed' (Wait-Until { (Read-Text "$D\cache\statusline\quota") -match "`t\?`n$" }) (Read-Text "$D\cache\statusline\quota")
+    # a tampered quota cache: numbers only, nothing evaluated
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    Write-Text "$D\cache\statusline\quota" ("$($now + 300)`t$now`t92`tq`ta[`$(printf owned > " + (ConvertTo-MsysPath $proof) + ")]`t1`t2`t3`t4`n")
+    $o = Invoke-Render $D
+    Check 'a tampered quota cache is not evaluated' ($o.Code -eq 0 -and -not (Test-Path -LiteralPath $proof) -and $o.Text -match "$($G.quota) 7d 2%") $o.Text
+    # Kimi Code reached the server since: its newer copy replaces ours
+    (Get-Item -LiteralPath $drules).LastWriteTime = (Get-Date).AddMinutes(-1)
+    Write-KimiCacheRules $D 2400
+    Write-Text "$D\cache\statusline\quota" "0`t0`t90`t?`n"   # a fetch is due
+    Invoke-Render $D | Out-Null
+    Check "... and a newer copy of Kimi Code's replaces it" (Wait-Until { (Read-Text $drules) -ceq "0`nk3`t2400`n" }) (Read-Text $drules)
     if ($Python) {
         $E = New-KimiHome 'kimiE' -BaseUrl $BaseUrl -Tui ''
         $cfg = (Read-Text "$E\config.toml") -replace '\[providers\."managed:kimi-code"\]', "  [providers.'managed:kimi-code']" -replace '\[providers\."managed:kimi-code"\.oauth\]', "[ providers . 'managed:kimi-code' . oauth ]"
         Write-Text "$E\config.toml" $cfg
         Invoke-Script $install @('-KimiHome', $E) | Out-Null
         Invoke-Render $E | Out-Null
-        Check 'provider header spelled another way: quota still fetched' (Wait-Until { (Read-Text "$E\cache\statusline\quota") -match "`t5h 5%" }) (Read-Text "$E\cache\statusline\quota")
+        Check 'provider header spelled another way: quota still fetched' (Wait-Until { (Read-Text "$E\cache\statusline\quota") -match "`tq`t5`t" }) (Read-Text "$E\cache\statusline\quota")
     } else { Skip 'provider header spelling' 'no Python for the mock server' }
 
     # ------------------------------------------------------------------ web mode ---
