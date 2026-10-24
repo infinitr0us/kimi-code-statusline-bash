@@ -32,7 +32,7 @@ Context use is left out because Kimi Code's second footer line already shows it.
 
 ## Requirements
 
-- Windows 10 or 11 with [Kimi Code](https://www.kimi.com/code). Tested with Kimi Code 2.2.0.
+- Windows 10 or 11 with [Kimi Code](https://www.kimi.com/code). Tested with Kimi Code 2.2.0 and 2.3.1.
 - [Git for Windows](https://git-scm.com/download/win), for its bash 5: `winget install Git.Git`
 - [jq](https://jqlang.org), for the quota, thinking effort, changed lines and cache countdown: `winget install jqlang.jq`. Without it, those parts stay empty.
 - A [Nerd Font](https://www.nerdfonts.com) as your terminal's font, for the icons.

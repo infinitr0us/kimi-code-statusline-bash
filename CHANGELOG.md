@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-10-24
 
 - Prompt-cache countdown at the end of the line, between turns: the minutes until Kimi Code's server drops the session's prompt cache (blue, yellow in the last 5 minutes, then `cold`), as the Claude Code status line has it. The duration per model is Kimi Code's own estimate, fetched once a day from its server without a token (Kimi Code's cached copy if that fails). The time of the last model call, whether a turn is running and model switches (which make it `cold`) come from the session log, so no hooks are needed.
 - The quota reads like ccline 2 in Claude Code: the time left in the 5-hour window and the day and time the week resets (`5h 5% · 3h41m · 7d 52% · Sat 23:34`). It is refetched right after a window resets.
