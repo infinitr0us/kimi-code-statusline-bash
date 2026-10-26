@@ -73,8 +73,14 @@ toml_command() { # $1 = a `command = ...` line -> REPLY = its string value; fals
 }
 
 json_str() { # $1 -> REPLY = $1 as a JSON string
-  local s=${1//\\/\\\\}
+  local s=${1//\\/\\\\} i o c u
   s=${s//\"/\\\"}; s=${s//$'\t'/\\t}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}
+  if [[ $s == *[[:cntrl:]]* ]]; then   # the other control characters, as \u00XX
+    for (( i = 1; i < 32; i++ )); do
+      printf -v o '%03o' "$i"; printf -v c "\\$o"; printf -v u '\\u%04x' "$i"
+      s=${s//$c/$u}
+    done
+  fi
   REPLY="\"$s\""
 }
 
@@ -91,12 +97,15 @@ sh_quote() { # $1 -> REPLY = $1 as one word for sh
 backup() { # $1 = file -> copied to <file>.bak-<date>-<time>, or -2, -3 .. if that is taken
   local b="$1.bak-$STAMP" n=2
   while [[ -e $b ]]; do b="$1.bak-$STAMP-$n"; n=$(( n + 1 )); done
-  cp -p "$1" "$b" && say "Backed up $1"
+  cp -p "$1" "$b" || die "could not back up $1, so it was left as it was."
+  say "Backed up $1"
 }
 
-read_file() { # $1 = file -> REPLY = its content, byte for byte (but NULs)
+read_file() { # $1 = file -> REPLY = its content, byte for byte (but NULs); false if it exists but can't be read
   REPLY=
-  [[ -f $1 ]] && IFS= read -r -d '' REPLY < "$1"
+  [[ -e $1 ]] || return 0
+  [[ -f $1 && -r $1 ]] || return 1
+  IFS= read -r -d '' REPLY < "$1"
   return 0
 }
 
@@ -121,8 +130,11 @@ main() {
         esac
         shift 2;;
       --force) opt_force=1; shift;;
-      -h|--help) sed -n '2,/^$/{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null ||
-                   echo "See https://github.com/$REPO#install"; exit 0;;
+      -h|--help)
+        if [[ -r ${BASH_SOURCE[0]:-} ]]; then sed -n '2,/^$/{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"
+        else echo "Options: --version TAG, --source PATH|URL, --kimi-home DIR, --bash PATH, --jq PATH, --force. See https://github.com/$REPO#install"
+        fi
+        exit 0;;
       *) die "unknown option $1 (see --help)";;
     esac
   done
@@ -188,7 +200,8 @@ main() {
     src_file=$src
     [[ -f $src_file ]] || die "$src_file does not exist."
   fi
-  read_file "$src_file"; script=$REPLY
+  read_file "$src_file" || { [[ -n $tmp ]] && rm -f "$tmp"; die "cannot read $src_file"; }
+  script=$REPLY
   [[ -n $tmp ]] && rm -f "$tmp"
   script=${script#$'\xef\xbb\xbf'}
   script=${script//$'\r\n'/$'\n'}      # bash needs LF
@@ -207,22 +220,30 @@ main() {
   local new_line="command = \"$toml_value\""
 
   local raw bom=0 nl=$'\n' i
-  read_file "$tui"; raw=$REPLY
+  read_file "$tui" || die "cannot read $tui, so it was left as it was."
+  raw=$REPLY
   [[ $raw == $'\xef\xbb\xbf'* ]] && { bom=1; raw=${raw#$'\xef\xbb\xbf'}; }
   [[ $raw == *$'\r\n'* ]] && nl=$'\r\n'
   LINES=()
   [[ -n $raw ]] && split_lines "$raw"
   local lines=("${LINES[@]}")
+  # Names spelled with escapes ("command") are not read here: refuse them rather than
+  # miss the status line command and add a second one.
+  local esc_header_re='^[[:space:]]*\[[^]#]*\\' esc_key_re='^[[:space:]]*"[^"]*\\[^=]*='
   for i in "${!lines[@]}"; do
     [[ ${lines[i]} =~ $DOTTED_RE ]] &&
       die "$tui sets status_line in a form this installer does not edit (${lines[i]}). Change it to a [status_line] table, or set $new_line there yourself."
+    [[ ${lines[i]} =~ $esc_header_re ]] &&
+      die "$tui has a table name with escapes (${lines[i]}), which this installer does not read. Write it plainly, or set $new_line under [status_line] yourself."
   done
   local header=-1 cmd_line=-1 current= have_current=0
   for i in "${!lines[@]}"; do [[ ${lines[i]} =~ $TABLE_RE ]] && { header=$i; break; }; done
   if (( header >= 0 )); then
     for (( i = header + 1; i < ${#lines[@]}; i++ )); do
       [[ ${lines[i]} =~ ^[[:space:]]*\[ ]] && break
-      [[ ${lines[i]} =~ $KEY_RE ]] && { cmd_line=$i; break; }
+      [[ ${lines[i]} =~ $esc_key_re ]] &&
+        die "$tui has a key with escapes in its [status_line] table (${lines[i]}), which this installer does not read. Write it plainly, or set $new_line there yourself."
+      (( cmd_line < 0 )) && [[ ${lines[i]} =~ $KEY_RE ]] && cmd_line=$i
     done
   fi
   if (( cmd_line >= 0 )); then
@@ -233,7 +254,8 @@ main() {
 
   # what to put back on uninstall: the line this replaced, and whether the table is ours
   local old= old_command= prev_line= prev_command= created=false has_prev_line=0 has_prev_command=0
-  read_file "$info"; old=$REPLY
+  read_file "$info" || die "cannot read $info"
+  old=$REPLY
   json_field "$old" command && old_command=$REPLY
   if (( have_current )) && [[ $current == "$command" || ( -n $old_command && $current == "$old_command" ) ]]; then
     json_field "$old" previousLine && { prev_line=$REPLY; has_prev_line=1; }
@@ -269,11 +291,11 @@ Run this installer with --force to replace it; uninstall.sh puts it back."
   mkdir -p "$app" || die "cannot create $app"
   write_kept() { # $1 = file, $2 = content: writes it, first backing up a different old one
     if [[ -f $1 ]]; then
-      read_file "$1"
+      read_file "$1" || die "cannot read $1"
       [[ $REPLY == "$2" ]] && return 0
       backup "$1"
     fi
-    printf '%s' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1" || die "cannot write $1"
+    printf '%s' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1" || { rm -f "$1.tmp"; die "cannot write $1"; }
   }
   write_kept "$app/statusline.sh" "$script"
   chmod 755 "$app/statusline.sh"
@@ -282,11 +304,9 @@ Run this installer with --force to replace it; uninstall.sh puts it back."
   if [[ -n $jq ]]; then write_kept "$app/jq-path.txt" "$jq"$'\n'
   else rm -f "$app/jq-path.txt"; fi
 
-  if [[ $new_raw != "$raw" ]]; then
-    [[ -f $tui ]] && backup "$tui"
-    # in place, so tui.toml keeps its permissions
-    { (( bom )) && printf '\xef\xbb\xbf'; printf '%s' "$new_raw"; } > "$tui" || die "cannot write $tui"
-  fi
+  # install.json before tui.toml: should tui.toml then fail, the record tells of a change not
+  # made, which is harmless (uninstall leaves a command that isn't this one alone); the
+  # other way round, the command it replaced could not be put back.
   local j_cmd j_pc=null j_pl=null version_json now
   json_str "$command"; j_cmd=$REPLY
   (( has_prev_command )) && { json_str "$prev_command"; j_pc=$REPLY; }
@@ -294,7 +314,13 @@ Run this installer with --force to replace it; uninstall.sh puts it back."
   json_str "$version"; version_json=$REPLY
   now=$(date +%Y-%m-%dT%H:%M:%S%z)
   printf '{\n  "version": %s,\n  "installedAt": "%s",\n  "command": %s,\n  "previousCommand": %s,\n  "previousLine": %s,\n  "createdTable": %s\n}\n' \
-    "$version_json" "$now" "$j_cmd" "$j_pc" "$j_pl" "$created" > "$info" || die "cannot write $info"
+    "$version_json" "$now" "$j_cmd" "$j_pc" "$j_pl" "$created" > "$info.tmp" && mv -f "$info.tmp" "$info" ||
+    { rm -f "$info.tmp"; die "cannot write $info, so tui.toml was left as it was."; }
+  if [[ $new_raw != "$raw" ]]; then
+    [[ -f $tui ]] && backup "$tui"
+    # in place, so tui.toml keeps its permissions
+    { (( bom )) && printf '\xef\xbb\xbf'; printf '%s' "$new_raw"; } > "$tui" || die "cannot write $tui"
+  fi
   say "tui.toml: [status_line] $new_line"
 
   # ----------------------------------------------------------------- smoke test ---

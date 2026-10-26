@@ -375,8 +375,9 @@ if [[ ${1:-} == --scan ]]; then
   pend_re='^(0|[1-9][0-9]{0,8}):(0|[1-9][0-9]{0,8})$'
   reset_k() { used=0 busy=0 model=- alias=- cur=- ra=- rm=-; }
   # bash 3.2 has no associative arrays, so these are parallel arrays (short lists): the
-  # session's logs files[i] with their size[i] and bytes consumed off[i], and the Edit/Write
-  # calls awaiting their result, pid[i] with pval[i] = "<added>:<removed>"
+  # session's logs files[i] with their size[i] and bytes consumed off[i], logs in the state
+  # but not on disk right now gone[i] with gone_off[i] (kept, should they come back), and
+  # the Edit/Write calls awaiting their result, pid[i] with pval[i] = "<added>:<removed>"
   pend_set() { # $1 = callId, $2 = "<added>:<removed>"
     local i
     for i in "${!pid[@]}"; do [[ ${pid[i]} == "$1" ]] && { pval[i]=$2; return 0; }; done
@@ -391,7 +392,7 @@ if [[ ${1:-} == --scan ]]; then
   }
   files=( "$sdir"/agents/*/wire.jsonl )
   [[ -f ${files[0]} ]] || exit 0
-  size=() off=() pid=() pval=()
+  size=() off=() gone=() gone_off=() pid=() pval=()
   added=0 removed=0 effort= kline=0
   reset_k
   if [[ -f $st ]]; then
@@ -400,7 +401,8 @@ if [[ ${1:-} == --scan ]]; then
       while IFS=$'\t' read -r k a b c d e g h; do
         case $k in
           F) if [[ $b =~ $NUM_RE ]]; then
-               for i in "${!files[@]}"; do [[ ${files[i]} == "$a" ]] && { off[i]=$b; break; }; done
+               for i in "${!files[@]}"; do [[ ${files[i]} == "$a" ]] && { off[i]=$b; continue 2; }; done
+               gone+=("$a"); gone_off+=("$b")
              fi;;
           P) [[ $b =~ $pend_re ]] && pend_set "$a" "$b";;
           K) if [[ $a =~ $NUM_RE && $b == [01] && $c =~ $ID_RE && $d =~ $ID_RE && $e =~ $ID_RE &&
@@ -412,7 +414,7 @@ if [[ ${1:-} == --scan ]]; then
     } < "$st"
     # written by a version without this K line (or a broken one): read the logs again from
     # the start
-    (( kline )) || { added=0 removed=0; off=(); pid=(); pval=(); }
+    (( kline )) || { added=0 removed=0; off=(); gone=(); gone_off=(); pid=(); pval=(); }
   fi
   [[ $added =~ $NUM_RE ]] || added=0
   [[ $removed =~ $NUM_RE ]] || removed=0
@@ -423,7 +425,9 @@ if [[ ${1:-} == --scan ]]; then
   done < <(file_sizes "${files[@]}" 2>/dev/null)
   # a log that shrank was rewritten: recount everything from scratch
   for i in "${!files[@]}"; do
-    if (( ${size[i]:-0} < ${off[i]:-0} )); then added=0 removed=0; reset_k; off=(); pid=(); pval=(); break; fi
+    if (( ${size[i]:-0} < ${off[i]:-0} )); then
+      added=0 removed=0; reset_k; off=(); gone=(); gone_off=(); pid=(); pval=(); break
+    fi
   done
 
   if command -v "$JQ" >/dev/null 2>&1; then
@@ -469,6 +473,7 @@ if [[ ${1:-} == --scan ]]; then
   { printf '%s\t%s\t%s\n' "$added" "$removed" "$effort"
     printf 'K\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$used" "$busy" "$model" "$alias" "$cur" "$ra" "$rm"
     for i in "${!files[@]}"; do [[ -n ${off[i]:-} ]] && printf 'F\t%s\t%s\n' "${files[i]}" "${off[i]}"; done
+    for i in "${!gone[@]}"; do printf 'F\t%s\t%s\n' "${gone[i]}" "${gone_off[i]}"; done
     for i in "${!pid[@]}"; do printf 'P\t%s\t%s\n' "${pid[i]}" "${pval[i]}"; done
   } > "$st.tmp" || exit 0
   # Backdate the state to just before this scan started: anything appended since then
@@ -540,7 +545,9 @@ if [[ -n $sid ]]; then
     if [[ -z $sdir ]]; then   # not in the usual place: look it up (one grep per session)
       iline=$(grep -m1 -F "\"sessionId\":\"$sid\"" "$KHOME/session_index.jsonl" 2>/dev/null)
       if [[ $iline =~ \"sessionDir\":\"(([^\"\\]|\\.)*)\" ]]; then
-        to_unix "${BASH_REMATCH[1]//\\\\/\\}"    # C:\\Users\\.. -> C:\Users\.. -> /c/Users/..
+        w=${BASH_REMATCH[1]} wp=   # JSON \\ \" \/ -> \ " / (C:\\Users\\.. -> C:\Users\..)
+        while [[ $w == *\\* ]]; do wp+=${w%%\\*}; w=${w#*\\}; wp+=${w:0:1}; w=${w:1}; done
+        to_unix "$wp$w"            # -> /c/Users/.. in Git Bash
         [[ -d $REPLY ]] && sdir=$REPLY
       fi
     fi
