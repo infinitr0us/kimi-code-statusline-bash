@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0] - Unreleased
+
+- macOS support. The same `statusline.sh` now also runs on macOS's own bash 3.2 (no associative arrays, `mapfile`, `EPOCHSECONDS` or `printf %T` there) with BSD `stat`, `touch`, `date` and `wc`, so on macOS it needs nothing beyond what the system has (jq is built into macOS 15 and later). Kimi Code on macOS runs the command through `sh -c`; renders take about 10 ms. Tested with Kimi Code 2.3.2 on macOS 27.
+- `install.sh` and `uninstall.sh` do on macOS what `install.ps1` and `uninstall.ps1` do on Windows: `curl ... | bash` or from the release zip, backups, `--force` for another tool's status line command and putting it back on uninstall. The command they write is `/bin/bash <Kimi home>/statusline-bash/statusline.sh`, quoted for `sh`; `--bash` picks another bash.
+- `tests/run-tests.sh`: the end-to-end tests on macOS, with `tests/render.py` running the status line as Kimi Code does there (`sh -c` in a process group of its own, killed at the timeout). CI runs them with the status line on macOS's bash 3.2 and on Homebrew's bash 5, next to the Windows tests.
+- Fixed: a `default_model` under `[secondary_model]` in `config.toml` replaced the top-level one, so the thinking effort from `config.toml` (shown until the session log has one) could go missing.
+- Reset times in the usage report are converted without `date`. An empty `PATH` no longer puts the current folder on the search path.
+
 ## [0.2.0] - 2026-10-24
 
 - Prompt-cache countdown at the end of the line, between turns: the minutes until Kimi Code's server drops the session's prompt cache (blue, yellow in the last 5 minutes, then `cold`), as the Claude Code status line has it. The duration per model is Kimi Code's own estimate, fetched once a day from its server without a token (Kimi Code's cached copy if that fails). The time of the last model call, whether a turn is running and model switches (which make it `cold`) come from the session log, so no hooks are needed.

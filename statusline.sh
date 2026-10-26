@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
-# kimi-code-statusline-bash: a Claude Code style status line for Kimi Code on Windows.
+# kimi-code-statusline-bash: a Claude Code style status line for Kimi Code on Windows and macOS.
 # https://github.com/infinitr0us/kimi-code-statusline-bash (MIT license)
 #    Ask When Needed | 󰚩 K3 · max | 󰉋 ~/Desktop | 󰊢 main | 󰪞 5h 5% · 3h41m · 7d 1% · Mon 07:00 | 󱦻 1h23m +120/-45 |  24m
 # (no context segment: the TUI's second footer line already shows context usage)
 #
-# How Kimi Code (2.1.1 to 2.3.1) runs it: `cmd.exe /d /s /c <command>` with a JSON
-# snapshot on stdin; only the first stdout line is used. install.ps1 points <command>
-# at statusline.cmd, which starts Git Bash on this file. A run still going at 300 ms is
-# killed (taskkill /T /F) and its output dropped. Each successful run repaints the
+# How Kimi Code (2.1.1 to 2.3.2) runs it: with a JSON snapshot on stdin; only the first
+# stdout line is used. On Windows through `cmd.exe /d /s /c <command>`: install.ps1 points
+# <command> at statusline.cmd, which starts Git Bash on this file. On macOS through
+# `sh -c <command>` in a process group of its own: install.sh points <command> at
+# /bin/bash and this file. A run still going at 300 ms is killed (taskkill /T /F, or
+# SIGKILL to the process group) and its output dropped. Each successful run repaints the
 # footer, which schedules the next run ~1 s later, so this runs about once a second
 # for as long as Kimi is open.
 #
-# The render path therefore sticks to bash builtins: in Git Bash every $(...) or pipe
-# costs a fork (~15 ms) and every external program ~25 ms more. Slow work runs in
-# detached workers that leave cache files for later renders to pick up:
+# One file for both: Git Bash is bash 5 with GNU tools, macOS has bash 3.2 (no associative
+# arrays, mapfile, EPOCHSECONDS or printf %T) with BSD tools, so everything here also runs
+# on bash 3.2, and the few spots that differ go through the helpers below.
+#
+# The render path sticks to bash builtins: in Git Bash every $(...) or pipe costs a fork
+# (~15 ms) and every external program ~25 ms more. (On macOS a fork costs ~2 ms, so there
+# bash 3.2 may call `date` for what bash 5 has built in.) Slow work runs in detached
+# workers that leave cache files for later renders to pick up:
 #   --refresh         refetch the plan quota (curl + jq) into cache/statusline/quota, and
 #                     once a day Kimi's prompt-cache durations into cache-rules
 #   --scan SID SDIR   fold new wire.jsonl records of session SID into SID.state:
@@ -27,26 +34,54 @@
 KSL_VERSION=dev   # stamped with the release tag by tools/build-release.ps1
 if [[ ${1:-} == --version ]]; then printf 'kimi-code-statusline-bash %s\n' "$KSL_VERSION"; exit 0; fi
 
-# A bash started by cmd.exe gets only the Windows PATH, without Git's Unix tools.
-# In Git Bash, / is the Git install folder wherever that is.
-PATH="/usr/bin:/mingw64/bin:/clangarm64/bin:$PATH"
+WIN=0 BSD=0
+case $OSTYPE in msys*|cygwin*) WIN=1;; darwin*|*bsd*) BSD=1;; esac
+BASH5=0
+(( BASH_VERSINFO[0] >= 5 )) && BASH5=1
 
-to_unix() { # $1 = Windows path -> REPLY = Git Bash path (C:\Users\x -> /c/Users/x)
-  REPLY=${1//\\//}
+if (( WIN )); then
+  # A bash started by cmd.exe gets only the Windows PATH, without Git's Unix tools.
+  # In Git Bash, / is the Git install folder wherever that is.
+  PATH="/usr/bin:/mingw64/bin:/clangarm64/bin${PATH:+:$PATH}"
+else
+  PATH="${PATH:+$PATH:}/usr/bin:/bin"   # (Kimi passes on its own environment, whatever started it)
+fi
+
+now() { # NOW = the current epoch
+  if (( BASH5 )); then NOW=$EPOCHSECONDS; else NOW=$(date +%s); fi
+}
+
+local_time() { # $1 = epoch, $2 = strftime format -> REPLY = that moment in local time
+  if (( BASH5 )); then printf -v REPLY "%($2)T" "$1"; else REPLY=$(date -r "$1" "+$2"); fi
+}
+
+# GNU (Git Bash) and BSD (macOS) stat and touch take different options
+file_sizes() { # $@ = files -> "<bytes> <file>" lines
+  if (( BSD )); then stat -f '%z %N' -- "$@"; else stat -c '%s %n' -- "$@"; fi
+}
+set_mtime() { # $1 = epoch, $2 = file
+  if (( BSD )); then touch -d "$(date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ)" "$2"; else touch -d "@$1" "$2"; fi
+}
+
+to_unix() { # $1 = Windows path -> REPLY = Git Bash path (C:\Users\x -> /c/Users/x); elsewhere as is
+  REPLY=$1
+  (( WIN )) || return 0
+  REPLY=${REPLY//\\//}
   if [[ $REPLY =~ ^([A-Za-z]):(.*)$ ]]; then
     REPLY="/${BASH_REMATCH[1],,}${BASH_REMATCH[2]}"
   fi
 }
 
 # Kimi's own rule: KIMI_CODE_HOME, else ~/.kimi-code. $HOME may be unset when spawned
-# from a Windows process, so ~ is USERPROFILE.
+# from a Windows process, so there ~ is USERPROFILE.
 if [[ -n ${KIMI_CODE_HOME:-} ]]; then
   to_unix "$KIMI_CODE_HOME"; KHOME=${REPLY%/}
-elif [[ -n ${USERPROFILE:-} ]]; then
+elif (( WIN )) && [[ -n ${USERPROFILE:-} ]]; then
   to_unix "$USERPROFILE"; KHOME="${REPLY%/}/.kimi-code"
 else
-  KHOME="$HOME/.kimi-code"
+  KHOME="${HOME%/}/.kimi-code"
 fi
+now
 
 CACHE_DIR="$KHOME/cache/statusline"
 # quota: "<next fetch epoch>\t<last good epoch>\t<color>\t<kind>[\t<5h %>\t<5h reset epoch>\t<7d %>
@@ -89,8 +124,8 @@ lock_busy() { # $1 = lock file; true while a live worker holds it
   local pid= ts=
   [[ -f $1 ]] || return 1
   read -r pid ts < "$1" 2>/dev/null
-  [[ $pid =~ ^[0-9]+$ && $ts =~ ^[0-9]+$ ]] || return 1
-  (( EPOCHSECONDS - ts <= LOCK_STALE )) && kill -0 "$pid" 2>/dev/null
+  [[ $pid =~ ^[0-9]+$ && $ts =~ $NUM_RE ]] || return 1
+  (( NOW - ts <= LOCK_STALE )) && kill -0 "$pid" 2>/dev/null
 }
 
 spawn() { "$BASH" "$0" "$@" </dev/null >/dev/null 2>&1 & }
@@ -111,10 +146,10 @@ worker_env() {
 
 take_lock() { # $1 = lock file; exits unless this worker now owns it
   LOCK=$1
-  if ! { set -C; printf '%s %s\n' "$$" "$EPOCHSECONDS" > "$LOCK"; } 2>/dev/null; then
+  if ! { set -C; printf '%s %s\n' "$$" "$NOW" > "$LOCK"; } 2>/dev/null; then
     set +C
     lock_busy "$LOCK" && exit 0
-    printf '%s %s\n' "$$" "$EPOCHSECONDS" > "$LOCK"   # take over an abandoned lock
+    printf '%s %s\n' "$$" "$NOW" > "$LOCK"   # take over an abandoned lock
   fi
   set +C
   trap 'rm -f "$LOCK"' EXIT
@@ -133,7 +168,7 @@ if [[ ${1:-} == --refresh ]]; then
     printf '%s\t%s\t%s\t%s\n' "$1" "$ok" "${col:-90}" "$data" > "$QUOTA_CACHE.tmp" &&
       mv -f "$QUOTA_CACHE.tmp" "$QUOTA_CACHE"
   }
-  fail() { save_quota $((EPOCHSECONDS + QUOTA_RETRY)); exit 0; }  # keeps the last good numbers
+  fail() { now; save_quota $((NOW + QUOTA_RETRY)); exit 0; }  # keeps the last good numbers
 
   # config.toml: base_url + oauth key + api_key of the managed kimi provider
   base=""; okey=""; apikey=""; sec=""; plan=0
@@ -155,7 +190,7 @@ if [[ ${1:-} == --refresh ]]; then
   done < "$KHOME/config.toml"
   # no Kimi Code plan anywhere in config.toml (only other providers' API keys): "-" tells
   # renders to hide the segment
-  if (( ! plan )); then data=- col=90; save_quota $((EPOCHSECONDS + QUOTA_TTL)); exit 0; fi
+  if (( ! plan )); then data=- col=90; save_quota $((NOW + QUOTA_TTL)); exit 0; fi
   [[ -z $base ]] && base="https://api.kimi.com/coding/v1"
 
   # The prompt-cache rules Kimi Code itself uses for its "cache expired" dialog: one public
@@ -163,13 +198,14 @@ if [[ ${1:-} == --refresh ]]; then
   fetched=0
   [[ -f $CACHE_RULES ]] && read -r fetched < "$CACHE_RULES"
   [[ $fetched =~ $NUM_RE ]] || fetched=0
-  if (( EPOCHSECONDS - fetched >= RULES_TTL )); then
+  if (( NOW - fetched >= RULES_TTL )); then
     rules_jq='.config.config | to_entries[] | select(.value.cache_duration | type == "number")
       | "\(.key)\t\(.value.cache_duration | floor)"'
     rules=$(curl -sf -m 8 -H 'Content-Type: application/json' -d '{"name":"estimated_cache_duration"}' \
       "${base%/}/client_configs" 2>/dev/null | "$JQ" -r "select(.name == \"estimated_cache_duration\") | $rules_jq" 2>/dev/null | tr -d '\r')
     if [[ -n $rules ]]; then
-      printf '%s\n%s\n' "$EPOCHSECONDS" "$rules" > "$CACHE_RULES.tmp" && mv -f "$CACHE_RULES.tmp" "$CACHE_RULES"
+      now
+      printf '%s\n%s\n' "$NOW" "$rules" > "$CACHE_RULES.tmp" && mv -f "$CACHE_RULES.tmp" "$CACHE_RULES"
     else
       # Kimi Code's copy, if newer than ours (Kimi Code may have reached the server since)
       own=
@@ -192,8 +228,9 @@ if [[ ${1:-} == --refresh ]]; then
     IFS=$'\t' read -r token exp < <("$JQ" -r '[.access_token // "", (.expires_at // 0 | tostring)] | @tsv' "$f" 2>/dev/null | tr -d '\r')
     [[ -n $token ]] && break
   done
+  now
   if [[ -n $token ]]; then
-    [[ $exp =~ ^[0-9]+$ ]] && (( exp > 0 && exp <= EPOCHSECONDS )) && fail
+    [[ $exp =~ $NUM_RE ]] && (( exp > 0 && exp <= NOW )) && fail
   else
     token=$apikey
   fi
@@ -228,14 +265,15 @@ if [[ ${1:-} == --refresh ]]; then
       ] | map(if . == "" then "-" else . end) | @tsv' <<<"$resp" 2>/dev/null | tr -d '\r')
   [[ $p5 =~ ^[0-9]+$ || $p7 =~ ^[0-9]+$ || $pm =~ ^[0-9]+$ ]] || fail
 
-  reset_epoch() { # $1 = reset time, ISO 8601 UTC ("-" if none) -> epoch, or "-"
-    local t=${1%Z} e=; t=${t%.*}
-    [[ -n $t && $t != - ]] && e=$(date -d "${t}Z" +%s 2>/dev/null)
-    [[ $e =~ $NUM_RE ]] || e=-
-    printf '%s' "$e"
+  reset_epoch() { # $1 = reset time, ISO 8601 UTC ("-" if none) -> REPLY = epoch, or "-"
+    local t=${1%Z}; t=${t%.*}
+    REPLY=-
+    [[ $t =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || return 0
+    iso_epoch "$t"
+    [[ $REPLY =~ $NUM_RE ]] || REPLY=-
   }
-  r5=$(reset_epoch "$r5")
-  r7=$(reset_epoch "$r7")
+  reset_epoch "$r5"; r5=$REPLY
+  reset_epoch "$r7"; r7=$REPLY
 
   maxp=0
   for p in "$p5" "$p7" "$pm"; do [[ $p =~ ^[0-9]+$ ]] && (( p > maxp )) && maxp=$p; done
@@ -248,12 +286,13 @@ if [[ ${1:-} == --refresh ]]; then
     [[ $v =~ $NUM_RE ]] || v=-
     data+=$'\t'$v
   done
-  ok=$EPOCHSECONDS
+  now
+  ok=$NOW
   # fetch again just after a window resets, so its percentage doesn't linger (a reset that
   # has passed already is the server's lag: the usual interval then)
-  next=$(( EPOCHSECONDS + QUOTA_TTL ))
+  next=$(( NOW + QUOTA_TTL ))
   for r in "$r5" "$r7"; do
-    [[ $r =~ $NUM_RE ]] && (( r + 5 > EPOCHSECONDS && r + 5 < next )) && next=$(( r + 5 ))
+    [[ $r =~ $NUM_RE ]] && (( r + 5 > NOW && r + 5 < next )) && next=$(( r + 5 ))
   done
   save_quota "$next"
   exit 0
@@ -327,7 +366,7 @@ if [[ ${1:-} == --scan ]]; then
   [[ -n $sid && -d $sdir ]] || exit 0
   worker_env
   take_lock "$CACHE_DIR/$sid.scan.lock"
-  t0=$EPOCHSECONDS
+  t0=$NOW
   st="$CACHE_DIR/$sid.state"
   # SID.state: "<added>\t<removed>\t<effort>", then "K\t<last model call epoch>\t<in a turn
   # 1|0>\t<its model>\t<its alias>\t<alias selected now>\t<last request's alias>\t<..model>"
@@ -335,16 +374,35 @@ if [[ ${1:-} == --scan ]]; then
   # "P\t<callId>\t<added>:<removed>" for Edit/Write calls still awaiting their result.
   pend_re='^(0|[1-9][0-9]{0,8}):(0|[1-9][0-9]{0,8})$'
   reset_k() { used=0 busy=0 model=- alias=- cur=- ra=- rm=-; }
+  # bash 3.2 has no associative arrays, so these are parallel arrays (short lists): the
+  # session's logs files[i] with their size[i] and bytes consumed off[i], and the Edit/Write
+  # calls awaiting their result, pid[i] with pval[i] = "<added>:<removed>"
+  pend_set() { # $1 = callId, $2 = "<added>:<removed>"
+    local i
+    for i in "${!pid[@]}"; do [[ ${pid[i]} == "$1" ]] && { pval[i]=$2; return 0; }; done
+    pid+=("$1"); pval+=("$2")
+  }
+  pend_take() { # $1 = callId -> REPLY = its "<added>:<removed>", now forgotten; false if none
+    local i
+    for i in "${!pid[@]}"; do
+      if [[ ${pid[i]} == "$1" ]]; then REPLY=${pval[i]}; unset 'pid[i]' 'pval[i]'; return 0; fi
+    done
+    return 1
+  }
+  files=( "$sdir"/agents/*/wire.jsonl )
+  [[ -f ${files[0]} ]] || exit 0
+  size=() off=() pid=() pval=()
   added=0 removed=0 effort= kline=0
   reset_k
-  declare -A off=() pend=() size=()
   if [[ -f $st ]]; then
     { IFS=$'\t' read -r added removed effort
       # numbers only: these end up in arithmetic, which would evaluate anything else
       while IFS=$'\t' read -r k a b c d e g h; do
         case $k in
-          F) [[ $b =~ $NUM_RE ]] && off[$a]=$b;;
-          P) [[ $b =~ $pend_re ]] && pend[$a]=$b;;
+          F) if [[ $b =~ $NUM_RE ]]; then
+               for i in "${!files[@]}"; do [[ ${files[i]} == "$a" ]] && { off[i]=$b; break; }; done
+             fi;;
+          P) [[ $b =~ $pend_re ]] && pend_set "$a" "$b";;
           K) if [[ $a =~ $NUM_RE && $b == [01] && $c =~ $ID_RE && $d =~ $ID_RE && $e =~ $ID_RE &&
                    $g =~ $ID_RE && $h =~ $ID_RE ]]; then
                used=$a busy=$b model=$c alias=$d cur=$e ra=$g rm=$h kline=1
@@ -354,45 +412,47 @@ if [[ ${1:-} == --scan ]]; then
     } < "$st"
     # written by a version without this K line (or a broken one): read the logs again from
     # the start
-    (( kline )) || { added=0 removed=0; off=(); pend=(); }
+    (( kline )) || { added=0 removed=0; off=(); pid=(); pval=(); }
   fi
   [[ $added =~ $NUM_RE ]] || added=0
   [[ $removed =~ $NUM_RE ]] || removed=0
 
-  files=( "$sdir"/agents/*/wire.jsonl )
-  [[ -f ${files[0]} ]] || exit 0
-  while IFS= read -r l; do size[${l#* }]=${l%% *}; done < <(stat -c '%s %n' -- "${files[@]}")
+  while IFS= read -r l; do
+    [[ ${l%% *} =~ $NUM_RE ]] || continue
+    for i in "${!files[@]}"; do [[ ${files[i]} == "${l#* }" ]] && { size[i]=${l%% *}; break; }; done
+  done < <(file_sizes "${files[@]}" 2>/dev/null)
   # a log that shrank was rewritten: recount everything from scratch
-  for f in "${files[@]}"; do
-    if (( ${size[$f]:-0} < ${off[$f]:-0} )); then added=0 removed=0; reset_k; off=(); pend=(); break; fi
+  for i in "${!files[@]}"; do
+    if (( ${size[i]:-0} < ${off[i]:-0} )); then added=0 removed=0; reset_k; off=(); pid=(); pval=(); break; fi
   done
 
   if command -v "$JQ" >/dev/null 2>&1; then
-    for f in "${files[@]}"; do
-      o=${off[$f]:-0} s=${size[$f]:-0}
+    for i in "${!files[@]}"; do
+      f=${files[i]} o=${off[i]:-0} s=${size[i]:-0}
       (( s > o )) || continue
       main=false; [[ $f == */agents/main/wire.jsonl ]] && main=true
-      mapfile -t out < <(tail -c +$((o + 1)) -- "$f" | head -c $((s - o)) |
+      out=()
+      while IFS= read -r l || [[ -n $l ]]; do out+=("$l"); done < <(tail -c +$((o + 1)) -- "$f" | head -c $((s - o)) |
         "$JQ" -Rsr --argjson main "$main" --arg ra "$ra" --arg rm "$rm" "$JQ_SCAN" 2>/dev/null | tr -d '\r')
       # apply a chunk only if jq got all the way through it
-      (( ${#out[@]} )) && [[ ${out[-1]} == B ]] || continue
+      (( ${#out[@]} )) && [[ ${out[${#out[@]} - 1]} == B ]] || continue
       # Bytes consumed: the complete lines, so a record still being written is read whole by
       # the next scan. Counted here: jq's utf8bytelength of a raw line is off for some text
       # (long runs of emoji or U+FFFD, in jq 1.6 and 1.7), which would skip into a record.
       n=$(( s - o ))
       if [[ -n $(tail -c +"$s" -- "$f" | head -c 1) ]]; then   # (a newline would be stripped)
         p=$(tail -c +$((o + 1)) -- "$f" | head -c "$n" | tail -n 1 | wc -c)
+        p=${p//[[:space:]]/}                                    # (BSD wc pads the number)
         [[ $p =~ $NUM_RE ]] && (( p <= n )) || continue
         n=$(( n - p ))
       fi
-      off[$f]=$(( o + n ))
+      off[i]=$(( o + n ))
       for l in "${out[@]}"; do
         IFS=$'\t' read -r k a b c <<< "$l"
         case $k in
-          C) [[ $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ ]] && pend[$a]="$b:$c" ;;
-          R) v=${pend[$a]-}
-             [[ -n $v ]] || continue
-             unset 'pend[$a]'
+          C) [[ $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ ]] && pend_set "$a" "$b:$c" ;;
+          R) pend_take "$a" || continue
+             v=$REPLY
              [[ $b == 1 ]] || continue          # failed or declined: nothing changed
              [[ $c =~ ^[0-9]+$ ]] || c=1
              (( added += ${v%%:*} * c, removed += ${v#*:} * c )) ;;
@@ -408,12 +468,12 @@ if [[ ${1:-} == --scan ]]; then
 
   { printf '%s\t%s\t%s\n' "$added" "$removed" "$effort"
     printf 'K\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$used" "$busy" "$model" "$alias" "$cur" "$ra" "$rm"
-    for f in "${!off[@]}"; do printf 'F\t%s\t%s\n' "$f" "${off[$f]}"; done
-    for id in "${!pend[@]}"; do printf 'P\t%s\t%s\n' "$id" "${pend[$id]}"; done
+    for i in "${!files[@]}"; do [[ -n ${off[i]:-} ]] && printf 'F\t%s\t%s\n' "${files[i]}" "${off[i]}"; done
+    for i in "${!pid[@]}"; do printf 'P\t%s\t%s\n' "${pid[i]}" "${pval[i]}"; done
   } > "$st.tmp" || exit 0
   # Backdate the state to just before this scan started: anything appended since then
   # leaves a wire.jsonl newer than the state, so the next render schedules another scan.
-  touch -d "@$(( t0 - 1 ))" "$st.tmp"
+  set_mtime $(( t0 - 1 )) "$st.tmp"
   mv -f "$st.tmp" "$st"
   exit 0
 fi
@@ -429,27 +489,34 @@ jstr() { # $1 = key -> REPLY = its string value in the snapshot ('' when absent 
 }
 
 config_effort() { # REPLY = [thinking].effort, else default_model's default_effort; "off" when disabled
-  local l eff= tsec=0 toff=0 dmodel= cur= ovr=0
-  local -A effmap=()
+  # sec: where the line is: top (before any table), thinking, model / over(rides) of the
+  # default model, or "" (any other table). TOML has the top-level keys before the first
+  # table, so default_model is known by the time its [models."..."] table comes.
+  local l eff= toff=0 dmodel= sec=top meff=
   REPLY=
   [[ -f $KHOME/config.toml ]] || return
   while IFS= read -r l || [[ -n $l ]]; do
-    if   [[ $l =~ ^default_model[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then dmodel=${BASH_REMATCH[1]}
-    elif [[ $l =~ ^\[thinking\] ]]; then tsec=1; cur=; continue
-    elif [[ $l =~ ^\[models\.\"([^\"]+)\"\.overrides\] ]]; then cur=${BASH_REMATCH[1]}; ovr=1; tsec=0; continue
-    elif [[ $l =~ ^\[models\.\"([^\"]+)\"\] ]]; then cur=${BASH_REMATCH[1]}; ovr=0; tsec=0; continue
-    elif [[ $l =~ ^\[ ]]; then tsec=0; cur=; continue
+    if [[ $l =~ ^\[ ]]; then
+      sec=
+      if   [[ $l =~ ^\[thinking\] ]]; then sec=thinking
+      elif [[ $l =~ ^\[models\.\"([^\"]+)\"\.overrides\] ]]; then [[ ${BASH_REMATCH[1]} == "$dmodel" ]] && sec=over
+      elif [[ $l =~ ^\[models\.\"([^\"]+)\"\] ]]; then [[ ${BASH_REMATCH[1]} == "$dmodel" ]] && sec=model
+      fi
+      continue
     fi
-    if (( tsec )); then
-      [[ $l =~ ^[[:space:]]*effort[[:space:]]*=[[:space:]]*\"([a-zA-Z]+)\" ]] && eff=${BASH_REMATCH[1]}
-      [[ $l =~ ^[[:space:]]*enabled[[:space:]]*=[[:space:]]*false ]] && toff=1
-    elif [[ -n $cur && $l =~ ^[[:space:]]*default_effort[[:space:]]*=[[:space:]]*\"([a-zA-Z]+)\" ]]; then
-      { [[ -z ${effmap[$cur]:-} ]] || (( ovr )); } && effmap[$cur]=${BASH_REMATCH[1]}
-    fi
+    case $sec in
+      top) [[ $l =~ ^default_model[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] && dmodel=${BASH_REMATCH[1]} ;;
+      thinking)
+        [[ $l =~ ^[[:space:]]*effort[[:space:]]*=[[:space:]]*\"([a-zA-Z]+)\" ]] && eff=${BASH_REMATCH[1]}
+        [[ $l =~ ^[[:space:]]*enabled[[:space:]]*=[[:space:]]*false ]] && toff=1 ;;
+      model|over)   # the first default_effort in the model's table; its overrides win
+        if [[ $l =~ ^[[:space:]]*default_effort[[:space:]]*=[[:space:]]*\"([a-zA-Z]+)\" ]]; then
+          [[ -z $meff || $sec == over ]] && meff=${BASH_REMATCH[1]}
+        fi ;;
+    esac
   done < "$KHOME/config.toml"
   (( toff )) && eff=off
-  [[ -z $eff && -n $dmodel ]] && eff=${effmap[$dmodel]:-}
-  REPLY=$eff
+  REPLY=${eff:-$meff}
 }
 
 jstr model;          model=$REPLY
@@ -473,9 +540,8 @@ if [[ -n $sid ]]; then
     if [[ -z $sdir ]]; then   # not in the usual place: look it up (one grep per session)
       iline=$(grep -m1 -F "\"sessionId\":\"$sid\"" "$KHOME/session_index.jsonl" 2>/dev/null)
       if [[ $iline =~ \"sessionDir\":\"(([^\"\\]|\\.)*)\" ]]; then
-        w=${BASH_REMATCH[1]//\\\\/\\}             # C:\\Users\\.. -> C:\Users\..
-        wp=${w//\\//}; d=${wp:0:1}
-        [[ -d /${d,,}${wp:2} ]] && sdir="/${d,,}${wp:2}"
+        to_unix "${BASH_REMATCH[1]//\\\\/\\}"    # C:\\Users\\.. -> C:\Users\.. -> /c/Users/..
+        [[ -d $REPLY ]] && sdir=$REPLY
       fi
     fi
     if [[ -n $sdir ]]; then
@@ -497,7 +563,7 @@ if [[ -n $sid ]]; then
       fi
     fi
     if [[ -n $ep ]]; then
-      s=$(( EPOCHSECONDS - ep )); (( s < 0 )) && s=0
+      s=$(( NOW - ep )); (( s < 0 )) && s=0
       d=$(( s / 86400 )) h=$(( s % 86400 / 3600 )) mm=$(( s % 3600 / 60 ))
       if   (( d > 0 )); then el="${d}d${h}h"
       elif (( h > 0 )); then printf -v el '%dh%02dm' "$h" "$mm"
@@ -548,11 +614,11 @@ m="${esc}[1;96m󰚩 ${model}${RST}"
 parts+=("$m")
 
 # directory: ~ for the user's home, then the last 3 components (like Kimi's own footer)
-disp=${cwd//\\//}
+disp=$cwd
 if [[ -n $disp ]]; then
-  home=${USERPROFILE//\\//}
+  if (( WIN )); then disp=${disp//\\//} home=${USERPROFILE//\\//}; else home=${HOME%/}; fi
   if [[ -n $home ]]; then
-    shopt -s nocasematch                        # Windows paths are case-insensitive
+    shopt -s nocasematch                        # as Windows and macOS file names are
     if   [[ $disp == "$home" ]];   then disp="~"
     elif [[ $disp == "$home"/* ]]; then disp="~${disp:${#home}}"
     fi
@@ -573,13 +639,13 @@ qnext=0 qok=0 qcol="" qkind="" p5="" r5="" p7="" r7="" pm=""
 [[ $qok =~ $NUM_RE ]] || qok=0
 [[ $qcol =~ ^[0-9]{1,3}$ ]] || qcol=90
 case $qkind in q|-|'?') ;; *) qkind="" qnext=0;; esac   # an older version's cache: refetch
-if (( EPOCHSECONDS >= qnext )) && ! lock_busy "$CACHE_DIR/quota.lock"; then spawn --refresh; fi
+if (( NOW >= qnext )) && ! lock_busy "$CACHE_DIR/quota.lock"; then spawn --refresh; fi
 if [[ $qkind == q ]]; then
   qtext=""
   if [[ $p5 =~ ^[0-9]{1,4}$ ]]; then
     qtext="5h ${p5}%"
     if [[ $r5 =~ $NUM_RE ]]; then
-      t=$(( r5 > EPOCHSECONDS ? (r5 - EPOCHSECONDS + 59) / 60 : 0 ))   # minutes, rounded up
+      t=$(( r5 > NOW ? (r5 - NOW + 59) / 60 : 0 ))   # minutes, rounded up
       if (( t >= 60 )); then printf -v t '%dh%02dm' $(( t / 60 )) $(( t % 60 )); else t+=m; fi
       qtext+=" · $t"
     fi
@@ -587,12 +653,12 @@ if [[ $qkind == q ]]; then
   if [[ $p7 =~ ^[0-9]{1,4}$ ]]; then
     qtext+="${qtext:+ · }7d ${p7}%"
     if [[ $r7 =~ $NUM_RE ]]; then
-      printf -v t '%(%w %H:%M)T' "$r7"                # local time, as a bash builtin
-      qtext+=" · ${WEEKDAYS[${t%% *}]} ${t#* }"
+      local_time "$r7" '%w %H:%M'; t=$REPLY
+      [[ $t =~ ^[0-6]\  ]] && qtext+=" · ${WEEKDAYS[${t%% *}]} ${t#* }"
     fi
   fi
   [[ $pm =~ ^[0-9]{1,4}$ ]] && qtext+="${qtext:+ · }mo ${pm}%"
-  (( EPOCHSECONDS - qok > QUOTA_STALE )) && qcol=90   # last good fetch is old: grey it out
+  (( NOW - qok > QUOTA_STALE )) && qcol=90   # last good fetch is old: grey it out
   [[ -n $qtext ]] && parts+=("${esc}[${qcol}m󰪞 ${qtext}${RST}")
 elif [[ $qkind == '?' ]]; then
   parts+=("${esc}[90m󰪞 ?${RST}")                     # fetching fails, no numbers yet
@@ -620,7 +686,7 @@ if (( cused > 0 )) && [[ -f $CACHE_RULES ]]; then
   } < "$CACHE_RULES"
 fi
 if [[ $ttl =~ $NUM_RE ]] && (( ttl > 0 )); then
-  t=$(( cused + ttl - EPOCHSECONDS ))
+  t=$(( cused + ttl - NOW ))
   if (( t <= 0 )) || [[ $ccur != - && $ccur != "$calias" ]]; then
     parts+=("${esc}[33m cold${RST}")
   elif [[ $cbusy == 0 ]]; then

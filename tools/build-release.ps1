@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     dist\ gets statusline.sh with the tag stamped into KSL_VERSION, install.ps1,
-    uninstall.ps1, kimi-code-statusline-bash-<tag>.zip with all of it plus the docs,
+    uninstall.ps1, install.sh, uninstall.sh, kimi-code-statusline-bash-<tag>.zip with all
+    of it plus the docs,
     SHA256SUMS.txt, and NOTES.md (the CHANGELOG.md section of the tag, which must exist).
     The release workflow runs this on a pushed tag; run it locally to check a build.
 
@@ -34,14 +35,14 @@ $sh = [IO.File]::ReadAllText((Join-Path $repo 'statusline.sh')) -replace "`r`n",
 if ($sh -notmatch '(?m)^KSL_VERSION=dev ') { throw 'statusline.sh has no KSL_VERSION=dev line to stamp.' }
 $sh = $sh -replace '(?m)^KSL_VERSION=dev ', "KSL_VERSION=$Tag "
 [IO.File]::WriteAllText((Join-Path $pkg 'statusline.sh'), $sh, $utf8)
-foreach ($f in 'install.ps1', 'uninstall.ps1', 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'LICENSE') {
+foreach ($f in 'install.ps1', 'uninstall.ps1', 'install.sh', 'uninstall.sh', 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'LICENSE') {
     Copy-Item -LiteralPath (Join-Path $repo $f) -Destination $pkg
 }
 New-Item -ItemType Directory -Path (Join-Path $pkg 'assets') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'assets\screenshot.png') -Destination (Join-Path $pkg 'assets')   # the READMEs show it
 
 Compress-Archive -Path $pkg -DestinationPath (Join-Path $dist "$name.zip")
-foreach ($f in 'statusline.sh', 'install.ps1', 'uninstall.ps1') { Copy-Item -LiteralPath (Join-Path $pkg $f) -Destination $dist }
+foreach ($f in 'statusline.sh', 'install.ps1', 'uninstall.ps1', 'install.sh', 'uninstall.sh') { Copy-Item -LiteralPath (Join-Path $pkg $f) -Destination $dist }
 Remove-Item -LiteralPath $pkg -Recurse -Force
 
 $assets = Get-ChildItem -LiteralPath $dist -File | Where-Object { $_.Name -ne 'NOTES.md' } | Sort-Object Name

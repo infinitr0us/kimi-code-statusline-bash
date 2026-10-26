@@ -62,7 +62,7 @@ function Test-File([string]$Path) { $Path -and (Test-Path -LiteralPath $Path -Pa
 function Test-Ascii([string]$Text) { $Text -notmatch '[^\x00-\x7F]' }
 
 if ($env:OS -ne 'Windows_NT') {
-    throw 'kimi-code-statusline-bash is for Kimi Code on Windows (it runs on Git for Windows).'
+    throw 'This installer is for Kimi Code on Windows (it runs on Git for Windows). On macOS, use install.sh (see the README).'
 }
 Write-Host 'kimi-code-statusline-bash installer'
 
