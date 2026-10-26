@@ -25,6 +25,9 @@ DAYS=(Sun Mon Tue Wed Thu Fri Sat)
 PASSED=0 FAILED=0
 TIMES=()
 TEST_BASH=${KSL_TEST_BASH:-/bin/bash}
+# Kimi Code drops a run still going at 300 ms; CI's shared runners get more room
+RENDER_TIMEOUT=300
+[[ -n ${CI:-} ]] && RENDER_TIMEOUT=2000
 INSTALL_ARGS=()
 [[ -n ${KSL_TEST_BASH:-} ]] && INSTALL_ARGS=(--bash "$KSL_TEST_BASH")
 
@@ -109,7 +112,7 @@ render() {
   j_sid=null; [[ -n $sid ]] && { js "$sid"; j_sid=$REPLY; }
   json='{"model":"K3","cwd":'$j_cwd',"gitBranch":'$j_branch',"permissionMode":"'$mode'","planMode":'$plan
   json+=',"contextUsage":0.1,"contextTokens":1000,"maxContextTokens":10000,"sessionId":'$j_sid',"version":"2.3.2"}'
-  out=$(KIMI_CODE_HOME=$home "$PY" -I "$REPO/tests/render.py" "$command" "$json")
+  out=$(KIMI_CODE_HOME=$home "$PY" -I "$REPO/tests/render.py" "$command" "$json" "$RENDER_TIMEOUT")
   CODE=${out%%$'\t'*}; out=${out#*$'\t'}
   MS=${out%%$'\t'*}; RAW=${out#*$'\t'}
   TEXT=$(printf '%s' "$RAW" | sed $'s/\x1b\\[[0-9;]*m//g')
@@ -343,6 +346,24 @@ epoch_ms 5; write_text "$odir/state.json" '{"createdAt":'$REPLY'}'
 js "$odir"; write_text "$A/session_index.jsonl" '{"sessionId":"'$osid'","sessionDir":'$REPLY',"workDir":"/x"}'$'\n'
 render "$A" sid=$osid
 [[ $TEXT == *"$G_SESSION 5m" ]]; check 'a session found through session_index.jsonl' $? "$TEXT"
+qsid=session_quote
+qdir="$ROOT/else\"where/$qsid"
+epoch_ms 7; write_text "$qdir/state.json" '{"createdAt":'$REPLY'}'
+js "$qdir"; add_text "$A/session_index.jsonl" '{"sessionId":"'$qsid'","sessionDir":'$REPLY',"workDir":"/x"}'$'\n'
+render "$A" sid=$qsid
+[[ $TEXT == *"$G_SESSION 7m" ]]; check '... also with a " in its path' $? "$TEXT"
+
+# a sub-agent's log that is gone during a scan and then back: not counted twice
+sub="$sdir/agents/sub1/wire.jsonl"
+mv "$sub" "$ROOT/sub1.wire.jsonl"
+REC=; rec_edit c9 x y; rec_result c9 'Replaced 1 occurrence'; add_text "$main" "$REC"   # +1 -1
+render "$A" sid=$sid
+wait_until starts_with "$state" $'15\t9\tmax\n'; r=$?
+mv "$ROOT/sub1.wire.jsonl" "$sub"
+REC=; rec_edit c10 x y; rec_result c10 'Replaced 1 occurrence'; add_text "$main" "$REC"  # +1 -1
+render "$A" sid=$sid
+wait_until file_has "$state" $'^(16\t10|18\t11)\t' >/dev/null   # (18/11: sub1 counted again)
+(( r == 0 )) && starts_with "$state" $'16\t10\tmax\n'; check "a log that was gone during a scan isn't counted again when it's back" $? "$(head -1 "$state")"
 
 # ----------------------------------------------------------------------------- quota ---
 echo quota
@@ -565,6 +586,53 @@ run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
 [[ $CODE != 0 && $OUT == *'does not edit'* ]] && file_is "$h/tui.toml" $'status_line.command = "/tools/other.sh"\n'
 check 'a dotted status_line key: not edited, even with --force' $? "$OUT"
 
+# -------------------------------------------------------------------------- failures ---
+echo 'installer failures'
+tui=$'theme = "dark"\n\n[status_line]\ncommand = "/tools/other.sh"\n'
+# a tui.toml that can't be read must not pass for an empty one and be replaced
+new_home unreadable tui="$tui"; h=$REPLY
+chmod 200 "$h/tui.toml"
+run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
+chmod 600 "$h/tui.toml"
+count_files "$h" 'tui.toml.bak-*'
+[[ $CODE != 0 && $OUT == *'cannot read'* && $REPLY == 0 ]] && file_is "$h/tui.toml" "$tui"
+check 'an unreadable tui.toml: an error, and left as it was' $? "$OUT"
+# install.json first: if it can't be written, tui.toml stays, and the command it would
+# replace is not lost
+new_home 'no record' tui="$tui"; h=$REPLY
+mkdir -p "$h/statusline-bash/install.json.tmp"   # (a folder: install.json can't be written)
+run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
+[[ $CODE != 0 && $OUT == *'cannot write'* ]] && file_is "$h/tui.toml" "$tui"
+check "install.json can't be written: tui.toml is left as it was" $? "$OUT"
+rmdir "$h/statusline-bash/install.json.tmp"
+run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
+[[ $CODE == 0 && $("$JQ" -r .previousLine "$h/statusline-bash/install.json") == 'command = "/tools/other.sh"' ]]
+check '... and the next install still records the command it replaces' $? "$OUT"
+# a key spelled with escapes would be missed, and a second command added: refused
+t=$'[status_line]\n"com\\u006dand" = "/tools/other.sh"\n'
+new_home 'escaped key' tui="$t"; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
+[[ $CODE != 0 && $OUT == *escapes* ]] && file_is "$h/tui.toml" "$t"; check 'a [status_line] key with escapes: refused, nothing written' $? "$OUT"
+# a command with a control character (\b) in it: install.json must stay valid JSON
+t=$'[status_line]\ncommand = "echo \\bhello"\n'
+new_home 'control escape' tui="$t"; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
+pc=$("$JQ" -r .previousCommand "$h/statusline-bash/install.json" 2>&1)
+[[ $CODE == 0 && $pc == $'echo \bhello' ]]; check 'a replaced command with a control character: install.json stays valid JSON' $? "$OUT / $pc"
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+[[ $CODE == 0 ]] && file_is "$h/tui.toml" "$t"; check '... and uninstall puts it back' $? "$(cat "$h/tui.toml")"
+# uninstall that can't delete the installed files says so
+new_home 'locked app' tui=; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+chmod 555 "$h/statusline-bash"
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+chmod 755 "$h/statusline-bash"
+[[ $CODE != 0 && $OUT == *'could not delete'* ]]; check "uninstall.sh: files it could not delete are an error, not a success" $? "$OUT"
+OUT=$("$BASH" -s -- --help < "$REPO/install.sh" 2>&1)
+[[ $OUT == *--kimi-home* ]]; r=$?
+OUT+=$("$BASH" -s -- --help < "$REPO/uninstall.sh" 2>&1)
+(( r == 0 )) && [[ $OUT == *'Options: --kimi-home'* ]]; check 'piped into bash, --help still lists the options' $? "$OUT"
+
 # ------------------------------------------------------------------------- hardening ---
 echo hardening
 new_home kimiD tui=; D=$REPLY   # no usage API: every fetch fails
@@ -577,18 +645,18 @@ REC=; rec_edit d1 a b; rec_result d1 'Replaced 1 occurrence'; write_text "$dsdir
 proof="$ROOT/proof"
 dstate="$D/cache/statusline/$dsid.state"
 # an offset that bash arithmetic would evaluate: a[$(...)] runs the command substitution
-write_text "$dstate" $'0\t0\t\nF\t'"$dsdir/agents/main/wire.jsonl"$'\ta[$(printf owned > '"$proof"$')]\n'
+write_text "$dstate" $'0\t0\t\nK\t0\t0\t-\t-\t-\t-\t-\nF\t'"$dsdir/agents/main/wire.jsonl"$'\ta[$(printf owned > '"$proof"$')]\n'
 backdate 1H "$dstate"
 render "$D" sid=$dsid
 wait_until starts_with "$dstate" $'1\t1\t' && [[ ! -e $proof ]]; check 'a tampered session cache is not evaluated' $? "$(cat "$dstate")"
 drules="$D/cache/statusline/cache-rules"
 wait_until file_is "$drules" $'0\nk3\t1200\n'; check "server unreachable: Kimi Code's own copy of the cache rules, fetched again next time" $? "$(cat "$drules")"
 wait_until file_has "$D/cache/statusline/quota" $'\t\\?\n$'; check '... and the quota marked as failed' $? "$(cat "$D/cache/statusline/quota")"
-# a tampered quota cache: numbers only, nothing evaluated
+# a tampered quota cache: numbers only, nothing evaluated (r5 ends up in arithmetic)
 now=$(date +%s)
-write_text "$D/cache/statusline/quota" "$(( now + 300 ))"$'\t'"$now"$'\t92\tq\ta[$(printf owned > '"$proof"$')]\t1\t2\t3\t4\n'
+write_text "$D/cache/statusline/quota" "$(( now + 300 ))"$'\t'"$now"$'\t92\tq\t1\ta[$(printf owned > '"$proof"$')]\t2\t3\t4\n'
 render "$D"
-[[ $CODE == 0 && ! -e $proof && $TEXT == *"$G_QUOTA 7d 2%"* ]]; check 'a tampered quota cache is not evaluated' $? "$TEXT"
+[[ $CODE == 0 && ! -e $proof && $TEXT == *"$G_QUOTA 5h 1% $DOT 7d 2%"* ]]; check 'a tampered quota cache is not evaluated' $? "$TEXT"
 # Kimi Code reached the server since: its newer copy replaces ours
 backdate 1M "$drules"
 write_kimi_cache_rules "$D" 2400
@@ -611,7 +679,11 @@ wrap="$ROOT/wrapper"
 write_text "$wrap/statusline.sh" $'#!/bin/sh\n# kimi-code-statusline-bash decoy\necho decoy\n'
 new_home kimiW tui=; W=$REPLY
 OUT=$(cd "$wrap" && "$BASH" -s -- --kimi-home "$W" "${INSTALL_ARGS[@]}" < "$REPO/install.sh" 2>&1)
-[[ $OUT == *'Downloading https://github.com/'* ]] && ! grep -qs decoy "$W/statusline-bash/statusline.sh"
+CODE=$?
+# (offline, the download fails, and with it the install: but it was the download it tried)
+[[ $OUT == *'Downloading https://github.com/'* ]] &&
+  { [[ $OUT == *'could not download'* && ! -e $W/statusline-bash ]] ||
+    { [[ $CODE == 0 && -f $W/statusline-bash/statusline.sh ]] && ! grep -q decoy "$W/statusline-bash/statusline.sh"; }; }
 check 'piped into bash: downloads, ignoring a statusline.sh in the current folder' $? "$OUT"
 new_home kimiC tui="$KIMI_DEFAULT_TUI"; C=$REPLY
 OUT=$(cat "$REPO/install.sh" | "$BASH" -s -- --kimi-home "$C" --source "http://127.0.0.1:$PORT/download/statusline.sh" "${INSTALL_ARGS[@]}" 2>&1); CODE=$?

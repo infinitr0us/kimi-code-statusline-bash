@@ -68,12 +68,15 @@ sh_quote() { # $1 -> REPLY = $1 as one word for sh
 backup() { # $1 = file -> copied to <file>.bak-<date>-<time>, or -2, -3 .. if that is taken
   local b="$1.bak-$STAMP" n=2
   while [[ -e $b ]]; do b="$1.bak-$STAMP-$n"; n=$(( n + 1 )); done
-  cp -p "$1" "$b" && say "Backed up $1"
+  cp -p "$1" "$b" || die "could not back up $1, so it was left as it was."
+  say "Backed up $1"
 }
 
-read_file() { # $1 = file -> REPLY = its content, byte for byte (but NULs)
+read_file() { # $1 = file -> REPLY = its content, byte for byte (but NULs); false if it exists but can't be read
   REPLY=
-  [[ -f $1 ]] && IFS= read -r -d '' REPLY < "$1"
+  [[ -e $1 ]] || return 0
+  [[ -f $1 && -r $1 ]] || return 1
+  IFS= read -r -d '' REPLY < "$1"
   return 0
 }
 
@@ -91,8 +94,11 @@ main() {
   while (( $# )); do
     case $1 in
       --kimi-home) (( $# >= 2 )) || die "$1 needs a value"; opt_home=$2; shift 2;;
-      -h|--help) sed -n '2,/^$/{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null ||
-                   echo 'See https://github.com/infinitr0us/kimi-code-statusline-bash#uninstall'; exit 0;;
+      -h|--help)
+        if [[ -r ${BASH_SOURCE[0]:-} ]]; then sed -n '2,/^$/{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"
+        else echo 'Options: --kimi-home DIR. See https://github.com/infinitr0us/kimi-code-statusline-bash#uninstall'
+        fi
+        exit 0;;
       *) die "unknown option $1 (see --help)";;
     esac
   done
@@ -108,7 +114,8 @@ main() {
   home=$(CDPATH= cd -- "$home" && pwd) || die "cannot open $home"
   local app="$home/statusline-bash" tui="$home/tui.toml"
   local info= recorded=
-  read_file "$app/install.json"; info=$REPLY
+  read_file "$app/install.json" || die "cannot read $app/install.json"
+  info=$REPLY
   json_field "$info" command && recorded=$REPLY
   # the command install.sh writes by default (for an install.json gone missing)
   local default
@@ -117,7 +124,8 @@ main() {
   # ------------------------------------------------------------------- tui.toml ---
   if [[ -f $tui ]]; then
     local raw bom=0 nl=$'\n' i
-    read_file "$tui"; raw=$REPLY
+    read_file "$tui" || die "cannot read $tui, so it was left as it was."
+    raw=$REPLY
     [[ $raw == $'\xef\xbb\xbf'* ]] && { bom=1; raw=${raw#$'\xef\xbb\xbf'}; }
     [[ $raw == *$'\r\n'* ]] && nl=$'\r\n'
     split_lines "$raw"
@@ -167,8 +175,12 @@ main() {
   fi
 
   # ---------------------------------------------------------------------- files ---
-  local name
-  for name in statusline.sh jq-path.txt install.json; do rm -f "$app/$name"; done
+  local name left=()
+  for name in statusline.sh jq-path.txt install.json; do
+    rm -f "$app/$name" 2>/dev/null
+    [[ -e $app/$name ]] && left+=("$app/$name")
+  done
+  (( ${#left[@]} )) && die "could not delete ${left[*]}"
   if [[ -d $app ]]; then
     if [[ -n $(ls -A "$app") ]]; then say "Kept the backups in $app"; else rmdir "$app"; fi
   fi

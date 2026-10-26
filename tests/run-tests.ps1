@@ -518,7 +518,7 @@ try {
     $proof = Join-Path $Root 'proof'
     $dstate = "$D\cache\statusline\$dsid.state"
     # an offset that bash arithmetic would evaluate: a[$(...)] runs the command substitution
-    Write-Text $dstate ("0`t0`t`nF`t" + (ConvertTo-MsysPath "$dsdir\agents\main\wire.jsonl") + "`ta[`$(printf owned > " + (ConvertTo-MsysPath $proof) + ")]`n")
+    Write-Text $dstate ("0`t0`t`nK`t0`t0`t-`t-`t-`t-`t-`nF`t" + (ConvertTo-MsysPath "$dsdir\agents\main\wire.jsonl") + "`ta[`$(printf owned > " + (ConvertTo-MsysPath $proof) + ")]`n")
     (Get-Item -LiteralPath $dstate).LastWriteTime = (Get-Date).AddHours(-1)
     Invoke-Render $D -Sid $dsid | Out-Null
     $ok = Wait-Until { (Read-Text $dstate).StartsWith("1`t1`t") }
@@ -526,11 +526,11 @@ try {
     $drules = "$D\cache\statusline\cache-rules"
     Check "server unreachable: Kimi Code's own copy of the cache rules, fetched again next time" (Wait-Until { (Read-Text $drules) -ceq "0`nk3`t1200`n" }) (Read-Text $drules)
     Check '... and the quota marked as failed' (Wait-Until { (Read-Text "$D\cache\statusline\quota") -match "`t\?`n$" }) (Read-Text "$D\cache\statusline\quota")
-    # a tampered quota cache: numbers only, nothing evaluated
+    # a tampered quota cache: numbers only, nothing evaluated (r5 ends up in arithmetic)
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    Write-Text "$D\cache\statusline\quota" ("$($now + 300)`t$now`t92`tq`ta[`$(printf owned > " + (ConvertTo-MsysPath $proof) + ")]`t1`t2`t3`t4`n")
+    Write-Text "$D\cache\statusline\quota" ("$($now + 300)`t$now`t92`tq`t1`ta[`$(printf owned > " + (ConvertTo-MsysPath $proof) + ")]`t2`t3`t4`n")
     $o = Invoke-Render $D
-    Check 'a tampered quota cache is not evaluated' ($o.Code -eq 0 -and -not (Test-Path -LiteralPath $proof) -and $o.Text -match "$($G.quota) 7d 2%") $o.Text
+    Check 'a tampered quota cache is not evaluated' ($o.Code -eq 0 -and -not (Test-Path -LiteralPath $proof) -and $o.Text.Contains("$($G.quota) 5h 1% $($G.dot) 7d 2%")) $o.Text
     # Kimi Code reached the server since: its newer copy replaces ours
     (Get-Item -LiteralPath $drules).LastWriteTime = (Get-Date).AddMinutes(-1)
     Write-KimiCacheRules $D 2400
