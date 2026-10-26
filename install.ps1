@@ -230,6 +230,29 @@ function Test-OurCommand([string]$Value, [string]$Recorded) {
     ($v -ieq (& $plain $Command)) -or ($Recorded -and $v -ieq (& $plain $Recorded))
 }
 
+# The file as $lines and what ended each line, $seps ("`r`n", "`n", or '' for the last), so a
+# file with mixed line endings is written back as it was, but for the lines changed. (Ordinal
+# tests only: .NET's culture-aware string comparisons may ignore control characters.)
+function Split-Lines([string]$Text) {   # fills $lines and $seps
+    $start = 0
+    while (($i = $Text.IndexOf([char]10, $start)) -ge 0) {
+        $l = $Text.Substring($start, $i - $start)
+        if ($l.Length -gt 0 -and [int]$l[$l.Length - 1] -eq 13) { $lines.Add($l.Substring(0, $l.Length - 1)); $seps.Add("`r`n") }
+        else { $lines.Add($l); $seps.Add("`n") }
+        $start = $i + 1
+    }
+    $lines.Add($Text.Substring($start)); $seps.Add('')
+}
+function Add-Line([int]$At, [string]$Text) {
+    # a line put before line $At (or at the end), ending like the line before it
+    $sep = $nl
+    if ($At -gt 0 -and $seps[$At - 1].Length -gt 0) { $sep = $seps[$At - 1] }
+    if ($At -ge $lines.Count) {   # at the end: the old last line gets an end, the new one has none
+        if ($lines.Count -gt 0) { $seps[$lines.Count - 1] = $sep }
+        $lines.Add($Text); $seps.Add('')
+    } else { $lines.Insert($At, $Text); $seps.Insert($At, $sep) }
+}
+
 $raw = ''
 $bom = $false
 if (Test-File $TuiPath) {
@@ -237,12 +260,19 @@ if (Test-File $TuiPath) {
     $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
     $raw = $Utf8.GetString($bytes).TrimStart([char]0xFEFF)
 }
-$nl = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
 $lines = New-Object System.Collections.Generic.List[string]
-if ($raw.Length -gt 0) { $lines.AddRange([string[]]($raw -split "`r?`n")) }
+$seps = New-Object System.Collections.Generic.List[string]
+if ($raw.Length -gt 0) { Split-Lines $raw }
+# for lines that have no neighbor to follow: the more common line ending
+$nl = if (@($seps | Where-Object { $_.Length -eq 2 }).Count -gt @($seps | Where-Object { $_.Length -eq 1 }).Count) { "`r`n" } else { "`n" }
 foreach ($l in $lines) {
     if ($l -match $DottedRe) {
         throw "$TuiPath sets status_line in a form this installer does not edit ($($l.Trim())). Change it to a [status_line] table, or set command = `"$Command`" there yourself."
+    }
+    # names spelled with escapes ("status\u005fline", "com\u006dand") are not read here:
+    # refuse them rather than miss the status line command and add a second one
+    if ($l -match '^\s*\[[^\]#]*\\' -or $l -match '^\s*"[^"]*\\[^=]*=') {
+        throw "$TuiPath has a name spelled with escapes ($($l.Trim())), which this installer does not read. Write it plainly, or set command = `"$Command`" under [status_line] yourself."
     }
 }
 $header = -1
@@ -285,23 +315,41 @@ if ($current -and (Test-OurCommand $current $(if ($old) { $old.command }))) {
 
 $newLine = 'command = "' + $Command + '"'
 if ($cmdLine -ge 0) { $lines[$cmdLine] = $newLine }
-elseif ($header -ge 0) { $lines.Insert($header + 1, $newLine) }
-else {
-    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
-    if ($lines.Count -gt 0) { $lines.Add('') }
-    $lines.Add('[status_line]'); $lines.Add($newLine); $lines.Add('')
+elseif ($header -ge 0) { Add-Line ($header + 1) $newLine }
+else {   # a [status_line] table of its own at the end, after an empty line
+    $n = $lines.Count
+    if ($n -eq 0) { Add-Line 0 '[status_line]'; Add-Line 1 $newLine; Add-Line 2 '' }
+    elseif ($lines[$n - 1].Length -eq 0) {   # (the file ends with a newline: the table goes before it)
+        Add-Line ($n - 1) ''; Add-Line $n '[status_line]'; Add-Line ($n + 1) $newLine
+    } else {                                 # (no newline at the end, and none added)
+        Add-Line $n ''; Add-Line ($n + 1) '[status_line]'; Add-Line ($n + 2) $newLine
+    }
 }
-$newRaw = $lines -join $nl
+$sb = New-Object System.Text.StringBuilder
+for ($i = 0; $i -lt $lines.Count; $i++) { [void]$sb.Append($lines[$i]).Append($seps[$i]) }
+$newRaw = $sb.ToString()
+$changed = -not [string]::Equals($newRaw, $raw)
+if ($changed -and (Test-File $TuiPath)) {   # (tui.toml is written last, so find out now whether it can be)
+    try { [IO.File]::Open($TuiPath, 'Open', 'ReadWrite', 'ReadWrite').Dispose() }
+    catch { throw "Cannot write ${TuiPath}, so nothing was changed: $($_.Exception.Message)" }
+}
 
 # ------------------------------------------------------------------- write ---
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+function Backup-File([string]$Path) {
+    # copies $Path to <name>.bak-<stamp>, or -2, -3 .. if that is taken (as by the backup of
+    # an install in the same second)
+    $b = "$Path.bak-$stamp"; $n = 2
+    while (Test-Path -LiteralPath $b) { $b = "$Path.bak-$stamp-$n"; $n++ }
+    Copy-Item -LiteralPath $Path -Destination $b
+    Say "Backed up $Path"
+}
 function Write-Kept([string]$Path, [byte[]]$Bytes) {
-    # writes $Path, first copying an existing different file to <name>.bak-<stamp>
+    # writes $Path, first backing up an existing different file
     if (Test-File $Path) {
         $was = [IO.File]::ReadAllBytes($Path)
-        if ([Convert]::ToBase64String($was) -eq [Convert]::ToBase64String($Bytes)) { return }
-        Copy-Item -LiteralPath $Path -Destination "$Path.bak-$stamp"
-        Say "Backed up $Path"
+        if ([Convert]::ToBase64String($was) -ceq [Convert]::ToBase64String($Bytes)) { return }
+        Backup-File $Path
     }
     [IO.File]::WriteAllBytes($Path, $Bytes)
 }
@@ -321,17 +369,27 @@ $shim = @(
 )
 Write-Kept $ShimPath ([Text.Encoding]::ASCII.GetBytes(($shim -join "`r`n") + "`r`n"))
 
-if ($newRaw -ne $raw) {
-    if (Test-File $TuiPath) { Copy-Item -LiteralPath $TuiPath -Destination "$TuiPath.bak-$stamp"; Say "Backed up $TuiPath" }
-    $out = $Utf8.GetBytes($newRaw)
-    if ($bom) { $out = [byte[]](0xEF, 0xBB, 0xBF) + $out }
-    [IO.File]::WriteAllBytes($TuiPath, $out)
-}
+if ($changed -and (Test-File $TuiPath)) { Backup-File $TuiPath }
+# install.json goes before tui.toml, and back to what it was should tui.toml fail after all:
+# so it always tells of the command tui.toml runs, which is what uninstall puts back
+$oldInfo = $null
+if (Test-File $InfoPath) { $oldInfo = [IO.File]::ReadAllBytes($InfoPath) }
 $info = [ordered]@{
     version = $ver; installedAt = (Get-Date).ToString('o'); command = $Command
     previousCommand = $previousCommand; previousLine = $previousLine; createdTable = $createdTable
 }
-[IO.File]::WriteAllText($InfoPath, ($info | ConvertTo-Json) + "`n", $Utf8)
+try { [IO.File]::WriteAllText($InfoPath, ($info | ConvertTo-Json) + "`n", $Utf8) }
+catch { throw "Cannot write ${InfoPath}, so tui.toml was left as it was: $($_.Exception.Message)" }
+if ($changed) {
+    $out = $Utf8.GetBytes($newRaw)
+    if ($bom) { $out = [byte[]](0xEF, 0xBB, 0xBF) + $out }
+    try { [IO.File]::WriteAllBytes($TuiPath, $out) }
+    catch {
+        if ($null -ne $oldInfo) { [IO.File]::WriteAllBytes($InfoPath, $oldInfo) }
+        else { Remove-Item -LiteralPath $InfoPath -ErrorAction SilentlyContinue }
+        throw "Cannot write ${TuiPath} (see its backup), so install.json was put back as it was: $($_.Exception.Message)"
+    }
+}
 Say "tui.toml: [status_line] command = `"$Command`""
 
 # --------------------------------------------------------------- smoke test ---

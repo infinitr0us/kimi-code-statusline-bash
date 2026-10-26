@@ -50,6 +50,9 @@ function Wait-Until([scriptblock]$Condition, [int]$Seconds = 20) {
     [bool](& $Condition)
 }
 function Read-Text([string]$Path) { if (Test-Path -LiteralPath $Path) { [IO.File]::ReadAllText($Path) } else { '' } }
+function Test-Bytes([string]$Path, [string]$Text) {   # the file holds exactly $Text (compared byte for byte)
+    (Test-Path -LiteralPath $Path) -and ([Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) -ceq [Convert]::ToBase64String($Utf8.GetBytes($Text)))
+}
 function ConvertTo-MsysPath([string]$Path) { '/' + $Path.Substring(0, 1).ToLower() + ($Path.Substring(2) -replace '\\', '/') }
 function Get-EpochMs([double]$MinutesAgo = 0) { [DateTimeOffset]::UtcNow.AddMinutes(-$MinutesAgo).ToUnixTimeMilliseconds() }
 
@@ -505,6 +508,63 @@ try {
     $h = New-KimiHome 'comment mentions us' -Tui $tui
     $r = Invoke-Script $uninstall @('-KimiHome', $h)
     Check "uninstall leaves another tool's command alone, whatever its comment says" ($r.Code -eq 0 -and (Read-Text "$h\tui.toml") -ceq $tui) (Read-Text "$h\tui.toml")
+
+    # ------------------------------------------------------------- line endings ---
+    Write-Host 'line endings'
+    # lines added end like the line before them, no final newline is added, and install +
+    # uninstall give back every byte
+    foreach ($t in @(
+            @{ name = 'mixed line endings, a new table'; tui = "a = 1`r`nb = 2`n"; start = "a = 1`r`nb = 2`n`n[status_line]`ncommand = "; tail = "`"`n" },
+            @{ name = 'a command added under a CRLF header'; tui = "[status_line]`r`nitems = []`n"; start = "[status_line]`r`ncommand = "; tail = "`"`r`nitems = []`n" },
+            @{ name = 'no newline at the end'; tui = "theme = `"dark`""; start = "theme = `"dark`"`n`n[status_line]`ncommand = "; tail = '.cmd"' })) {
+        $h = New-KimiHome ('endings ' + $t.name) -Tui $t.tui
+        $r1 = Invoke-Script $install @('-KimiHome', $h)
+        $mid = $Utf8.GetString([IO.File]::ReadAllBytes("$h\tui.toml"))
+        $shape = $mid.StartsWith($t.start, [StringComparison]::Ordinal) -and $mid.EndsWith($t.tail, [StringComparison]::Ordinal)
+        $r2 = Invoke-Script $uninstall @('-KimiHome', $h)
+        Check "$($t.name): new lines follow their neighbors, and uninstall gives back every byte" ($r1.Code -eq 0 -and $r2.Code -eq 0 -and $shape -and (Test-Bytes "$h\tui.toml" $t.tui)) ($mid -replace "`r", '\r' -replace "`n", '\n')
+    }
+    # backups made in the same second (an uninstall right after the install) keep apart
+    $h = New-KimiHome 'same second' -Tui $KimiDefaultTui
+    $t0 = Get-Date
+    for ($k = 0; $k -lt 30; $k++) { Write-Text ("$h\tui.toml.bak-" + $t0.AddSeconds($k).ToString('yyyyMMdd-HHmmss')) 'taken' }
+    $r1 = Invoke-Script $install @('-KimiHome', $h)
+    $r2 = Invoke-Script $uninstall @('-KimiHome', $h)
+    $baks = @(Get-ChildItem -LiteralPath $h -Filter 'tui.toml.bak-*')
+    $taken = @($baks | Where-Object { Test-Bytes $_.FullName 'taken' }).Count
+    $orig = @($baks | Where-Object { Test-Bytes $_.FullName $KimiDefaultTui }).Count
+    Check 'backups never overwrite each other' ($r1.Code -eq 0 -and $r2.Code -eq 0 -and $baks.Count -eq 32 -and $taken -eq 30 -and $orig -eq 1) "$($baks.Count) backups, $taken taken, $orig original"
+
+    # -------------------------------------------------------- installer failures ---
+    Write-Host 'installer failures'
+    $tuiO = "theme = `"dark`"`n`n[status_line]`ncommand = `"C:/tools/other.cmd`"`n"
+    # install.json first: if it can't be written, tui.toml stays, and the command it would
+    # replace is not lost
+    $h = New-KimiHome 'no record' -Tui $tuiO
+    New-Item -ItemType Directory -Force -Path "$h\statusline-bash\install.json" | Out-Null   # (a folder: install.json can't be written)
+    $r = Invoke-Script $install @('-KimiHome', $h, '-Force')
+    Check "install.json can't be written: tui.toml is left as it was" ($r.Code -ne 0 -and $r.Output -match 'Cannot write' -and (Test-Bytes "$h\tui.toml" $tuiO)) $r.Output
+    Remove-Item -LiteralPath "$h\statusline-bash\install.json"
+    $r = Invoke-Script $install @('-KimiHome', $h, '-Force')
+    $info = [IO.File]::ReadAllText("$h\statusline-bash\install.json", $Utf8) | ConvertFrom-Json
+    Check '... and the next install still records the command it replaces' ($r.Code -eq 0 -and $info.previousLine -ceq 'command = "C:/tools/other.cmd"') $r.Output
+    # a tui.toml that can't be written: refused before anything is written
+    $h = New-KimiHome 'read-only tui' -Tui $tuiO
+    (Get-Item -LiteralPath "$h\tui.toml").IsReadOnly = $true
+    $r = Invoke-Script $install @('-KimiHome', $h, '-Force')
+    (Get-Item -LiteralPath "$h\tui.toml").IsReadOnly = $false
+    Check "a tui.toml that can't be written: an error, nothing written" ($r.Code -ne 0 -and $r.Output -match 'Cannot write' -and (Test-Bytes "$h\tui.toml" $tuiO) -and -not (Test-Path -LiteralPath "$h\statusline-bash")) $r.Output
+    # names spelled with escapes would be missed, and a second command added: refused
+    $k = 0
+    foreach ($t in @(
+            "[status_line]`n`"com\u006dand`" = `"C:/tools/other.cmd`"`n",
+            "`"status\u005fline`".command = `"C:/tools/other.cmd`"`n",
+            "`"status\u005fline`" = { command = `"C:/tools/other.cmd`" }`n",
+            "[`"status\u005fline`"]`ncommand = `"C:/tools/other.cmd`"`n")) {
+        $h = New-KimiHome ('escaped ' + $k) -Tui $t; $k++
+        $r = Invoke-Script $install @('-KimiHome', $h, '-Force')
+        Check "a name with escapes is refused, nothing written: $($t.Split([char]10)[0])" ($r.Code -ne 0 -and $r.Output -match 'escapes' -and (Test-Bytes "$h\tui.toml" $t)) $r.Output
+    }
 
     # ---------------------------------------------------------------- hardening ---
     Write-Host 'hardening'

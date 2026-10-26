@@ -6,6 +6,8 @@
 - `install.sh` and `uninstall.sh` do on macOS what `install.ps1` and `uninstall.ps1` do on Windows: `curl ... | bash` or from the release zip, backups, `--force` for another tool's status line command and putting it back on uninstall. The command they write is `/bin/bash <Kimi home>/statusline-bash/statusline.sh`, quoted for `sh`; `--bash` picks another bash.
 - `tests/run-tests.sh`: the end-to-end tests on macOS, with `tests/render.py` running the status line as Kimi Code does there (`sh -c` in a process group of its own, killed at the timeout). CI runs them with the status line on macOS's bash 3.2 and on Homebrew's bash 5, next to the Windows tests.
 - Fixed: a `default_model` under `[secondary_model]` in `config.toml` replaced the top-level one, so the thinking effort from `config.toml` (shown until the session log has one) could go missing.
+- Fixed in both installers: a `tui.toml` with mixed line endings, or without a final newline, now comes back byte for byte on uninstall. Lines the installer adds end like the line before them, and it adds no final newline.
+- Fixed in `install.ps1` and `uninstall.ps1`: a backup made in the same second as another one (an uninstall right after an install) no longer overwrites it and with it the original `tui.toml`. `install.json` is written before `tui.toml`, and put back if `tui.toml` can't be written, so a failed install can't lose the command it replaced; whether `tui.toml` can be written is checked before anything is written. Table names and keys spelled with escapes (`"status\u005fline"`) are refused instead of missed.
 - Reset times in the usage report are converted without `date`. An empty `PATH` no longer puts the current folder on the search path.
 
 ## [0.2.0] - 2026-10-24

@@ -109,13 +109,36 @@ read_file() { # $1 = file -> REPLY = its content, byte for byte (but NULs); fals
   return 0
 }
 
-split_lines() { # $1 = text -> LINES = its lines, without \r\n or \n; the last one may be ""
+# A file as LINES[i] and what ended each, SEPS[i] ("\r\n", "\n", or "" for the last), so a
+# file with mixed line endings is written back as it was, but for the lines changed.
+split_lines() { # $1 = text -> LINES, SEPS (the last line may be "": the text ended with a newline)
   local s=$1 l
-  LINES=()
+  LINES=() SEPS=()
   while [[ $s == *$'\n'* ]]; do
-    l=${s%%$'\n'*}; LINES+=("${l%$'\r'}"); s=${s#*$'\n'}
+    l=${s%%$'\n'*}; s=${s#*$'\n'}
+    if [[ $l == *$'\r' ]]; then LINES+=("${l%$'\r'}"); SEPS+=($'\r\n'); else LINES+=("$l"); SEPS+=($'\n'); fi
   done
-  LINES+=("${s%$'\r'}")
+  LINES+=("$s"); SEPS+=('')
+  local crlf=0 lf=0
+  for s in "${SEPS[@]}"; do case $s in $'\r\n') crlf=$(( crlf + 1 ));; $'\n') lf=$(( lf + 1 ));; esac; done
+  NL=$'\n'; (( crlf > lf )) && NL=$'\r\n'   # for lines that have no neighbor to follow
+}
+
+join_lines() { # LINES, SEPS -> REPLY = the text
+  local i
+  REPLY=
+  for i in "${!LINES[@]}"; do REPLY+=${LINES[i]}${SEPS[i]}; done
+}
+
+insert_line() { # $1 = index, $2 = text: a line put before LINES[$1] (or at the end), ending like the one before it
+  local k=$1 n=${#LINES[@]} sep=$NL
+  (( k > 0 )) && [[ -n ${SEPS[k-1]} ]] && sep=${SEPS[k-1]}
+  if (( k >= n )); then   # at the end: the old last line gets an end, the new one has none
+    (( n > 0 )) && SEPS[n-1]=$sep
+    LINES+=("$2"); SEPS+=('')
+  else
+    LINES=("${LINES[@]:0:k}" "$2" "${LINES[@]:k}"); SEPS=("${SEPS[@]:0:k}" "$sep" "${SEPS[@]:k}")
+  fi
 }
 
 main() {
@@ -219,33 +242,31 @@ main() {
   local toml_value=${command//\\/\\\\}; toml_value=${toml_value//\"/\\\"}
   local new_line="command = \"$toml_value\""
 
-  local raw bom=0 nl=$'\n' i
+  local raw bom=0 i
   read_file "$tui" || die "cannot read $tui, so it was left as it was."
   raw=$REPLY
   [[ $raw == $'\xef\xbb\xbf'* ]] && { bom=1; raw=${raw#$'\xef\xbb\xbf'}; }
-  [[ $raw == *$'\r\n'* ]] && nl=$'\r\n'
-  LINES=()
+  LINES=() SEPS=() NL=$'\n'
   [[ -n $raw ]] && split_lines "$raw"
-  local lines=("${LINES[@]}")
-  # Names spelled with escapes ("status_line", "command") are not read here:
+  # Names spelled with escapes ("status\u005fline", "com\u006dand") are not read here:
   # refuse them rather than miss the status line command and add a second one.
   local esc_header_re='^[[:space:]]*\[[^]#]*\\' esc_key_re='^[[:space:]]*"[^"]*\\[^=]*='
-  for i in "${!lines[@]}"; do
-    [[ ${lines[i]} =~ $DOTTED_RE ]] &&
-      die "$tui sets status_line in a form this installer does not edit (${lines[i]}). Change it to a [status_line] table, or set $new_line there yourself."
-    [[ ${lines[i]} =~ $esc_header_re || ${lines[i]} =~ $esc_key_re ]] &&
-      die "$tui has a name spelled with escapes (${lines[i]}), which this installer does not read. Write it plainly, or set $new_line under [status_line] yourself."
+  for i in "${!LINES[@]}"; do
+    [[ ${LINES[i]} =~ $DOTTED_RE ]] &&
+      die "$tui sets status_line in a form this installer does not edit (${LINES[i]}). Change it to a [status_line] table, or set $new_line there yourself."
+    [[ ${LINES[i]} =~ $esc_header_re || ${LINES[i]} =~ $esc_key_re ]] &&
+      die "$tui has a name spelled with escapes (${LINES[i]}), which this installer does not read. Write it plainly, or set $new_line under [status_line] yourself."
   done
   local header=-1 cmd_line=-1 current= have_current=0
-  for i in "${!lines[@]}"; do [[ ${lines[i]} =~ $TABLE_RE ]] && { header=$i; break; }; done
+  for i in "${!LINES[@]}"; do [[ ${LINES[i]} =~ $TABLE_RE ]] && { header=$i; break; }; done
   if (( header >= 0 )); then
-    for (( i = header + 1; i < ${#lines[@]}; i++ )); do
-      [[ ${lines[i]} =~ ^[[:space:]]*\[ ]] && break
-      [[ ${lines[i]} =~ $KEY_RE ]] && { cmd_line=$i; break; }
+    for (( i = header + 1; i < ${#LINES[@]}; i++ )); do
+      [[ ${LINES[i]} =~ ^[[:space:]]*\[ ]] && break
+      [[ ${LINES[i]} =~ $KEY_RE ]] && { cmd_line=$i; break; }
     done
   fi
   if (( cmd_line >= 0 )); then
-    toml_command "${lines[cmd_line]}" || die "Could not read the status line command in $tui: ${lines[cmd_line]}"
+    toml_command "${LINES[cmd_line]}" || die "Could not read the status line command in $tui: ${LINES[cmd_line]}"
     current=$REPLY
     [[ -n $current ]] && have_current=1
   fi
@@ -263,27 +284,29 @@ main() {
   elif (( have_current )); then
     (( opt_force )) || die "tui.toml already runs another status line command: $current
 Run this installer with --force to replace it; uninstall.sh puts it back."
-    prev_line=${lines[cmd_line]} has_prev_line=1 prev_command=$current has_prev_command=1
+    prev_line=${LINES[cmd_line]} has_prev_line=1 prev_command=$current has_prev_command=1
     say "Replacing the status line command $current"
   else
-    (( cmd_line >= 0 )) && { prev_line=${lines[cmd_line]}; has_prev_line=1; }   # command = "" stays as it was
+    (( cmd_line >= 0 )) && { prev_line=${LINES[cmd_line]}; has_prev_line=1; }   # command = "" stays as it was
     (( header < 0 )) && created=true
   fi
 
   if (( cmd_line >= 0 )); then
-    lines[cmd_line]=$new_line
+    LINES[cmd_line]=$new_line
   elif (( header >= 0 )); then
-    lines=("${lines[@]:0:header+1}" "$new_line" "${lines[@]:header+1}")
-  else
-    local n=${#lines[@]}
-    (( n > 0 )) && [[ -z ${lines[n-1]} ]] && { unset 'lines[n-1]'; n=$(( n - 1 )); }
-    (( n > 0 )) && lines+=('')
-    lines+=('[status_line]' "$new_line" '')
+    insert_line $(( header + 1 )) "$new_line"
+  else   # a [status_line] table of its own at the end, after an empty line
+    local n=${#LINES[@]}
+    if (( n == 0 )); then
+      insert_line 0 '[status_line]'; insert_line 1 "$new_line"; insert_line 2 ''
+    elif [[ -z ${LINES[n-1]} ]]; then   # (the file ends with a newline: the table goes before it)
+      insert_line $(( n - 1 )) ''; insert_line $n '[status_line]'; insert_line $(( n + 1 )) "$new_line"
+    else                                # (no newline at the end, and none added)
+      insert_line $n ''; insert_line $(( n + 1 )) '[status_line]'; insert_line $(( n + 2 )) "$new_line"
+    fi
   fi
-  local new_raw= first=1
-  for i in "${!lines[@]}"; do
-    if (( first )); then new_raw=${lines[i]}; first=0; else new_raw+=$nl${lines[i]}; fi
-  done
+  local new_raw
+  join_lines; new_raw=$REPLY
 
   # ---------------------------------------------------------------------- write ---
   local changed=0

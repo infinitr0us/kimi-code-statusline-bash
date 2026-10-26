@@ -576,6 +576,38 @@ run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
 text_of "$h/tui.toml"; [[ $T =~ command\ =\ \"([^\"]+)\" ]] && write_text "$h/tui.toml" "${T/\"${BASH_REMATCH[1]}\"/'${BASH_REMATCH[1]}'}"
 run_script "$REPO/uninstall.sh" --kimi-home "$h"
 [[ $CODE == 0 ]] && ! grep -q command "$h/tui.toml"; check 'uninstall recognizes its command in a literal string' $? "$(cat "$h/tui.toml")"
+# line endings: lines added end like the line before them, no final newline is added, and
+# install + uninstall give back every byte
+t=$'a = 1\r\nb = 2\n'
+new_home 'endings new table' tui="$t"; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+starts_with "$h/tui.toml" $'a = 1\r\nb = 2\n\n[status_line]\ncommand = ' && file_has "$h/tui.toml" $'[^\r]\n$'; r=$?
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+(( r == 0 )) && file_is "$h/tui.toml" "$t"; check 'mixed line endings, a new table: it follows the last line, and uninstall gives back every byte' $? "$(od -c "$h/tui.toml" | head -5)"
+t=$'[status_line]\r\nitems = []\n'
+new_home 'endings in table' tui="$t"; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+file_has "$h/tui.toml" $'^\\[status_line]\r\ncommand = "[^"]+"\r\nitems = \\[]\n$'; r=$?
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+(( r == 0 )) && file_is "$h/tui.toml" "$t"; check '... the command added under a CRLF header ends in CRLF, and goes again' $? "$(od -c "$h/tui.toml" | head -5)"
+t='theme = "dark"'
+new_home 'endings none at the end' tui="$t"; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+file_has "$h/tui.toml" $'^theme = "dark"\n\n\\[status_line]\ncommand = "[^"]+"$'; r=$?
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+(( r == 0 )) && file_is "$h/tui.toml" "$t"; check '... no newline at the end: none added, and every byte given back' $? "$(od -c "$h/tui.toml" | head -5)"
+# backups made in the same second (an uninstall right after the install) keep apart
+new_home 'same second' tui="$KIMI_DEFAULT_TUI"; h=$REPLY
+now=$(date +%s)
+for (( s = 0; s < 30; s++ )); do printf taken > "$h/tui.toml.bak-$(date -r $(( now + s )) +%Y%m%d-%H%M%S)"; done
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"; r=$CODE
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+taken=0 orig=0 n=0
+for f in "$h"/tui.toml.bak-*; do
+  n=$(( n + 1 )); text_of "$f"
+  [[ $T == taken ]] && taken=$(( taken + 1 )); [[ $T == "$KIMI_DEFAULT_TUI" ]] && orig=$(( orig + 1 ))
+done
+[[ $r == 0 && $CODE == 0 && $n == 32 && $taken == 30 && $orig == 1 ]]; check 'backups never overwrite each other' $? "$n backups, $taken taken, $orig original / $(ls "$h")"
 tui=$'[status_line]\ncommand = "/tools/other.sh" # was = "/bin/bash /x/statusline-bash/statusline.sh"\n'
 new_home 'comment mentions us' tui="$tui"; h=$REPLY
 run_script "$REPO/uninstall.sh" --kimi-home "$h"
