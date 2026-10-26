@@ -227,23 +227,21 @@ main() {
   LINES=()
   [[ -n $raw ]] && split_lines "$raw"
   local lines=("${LINES[@]}")
-  # Names spelled with escapes ("command") are not read here: refuse them rather than
-  # miss the status line command and add a second one.
+  # Names spelled with escapes ("status_line", "command") are not read here:
+  # refuse them rather than miss the status line command and add a second one.
   local esc_header_re='^[[:space:]]*\[[^]#]*\\' esc_key_re='^[[:space:]]*"[^"]*\\[^=]*='
   for i in "${!lines[@]}"; do
     [[ ${lines[i]} =~ $DOTTED_RE ]] &&
       die "$tui sets status_line in a form this installer does not edit (${lines[i]}). Change it to a [status_line] table, or set $new_line there yourself."
-    [[ ${lines[i]} =~ $esc_header_re ]] &&
-      die "$tui has a table name with escapes (${lines[i]}), which this installer does not read. Write it plainly, or set $new_line under [status_line] yourself."
+    [[ ${lines[i]} =~ $esc_header_re || ${lines[i]} =~ $esc_key_re ]] &&
+      die "$tui has a name spelled with escapes (${lines[i]}), which this installer does not read. Write it plainly, or set $new_line under [status_line] yourself."
   done
   local header=-1 cmd_line=-1 current= have_current=0
   for i in "${!lines[@]}"; do [[ ${lines[i]} =~ $TABLE_RE ]] && { header=$i; break; }; done
   if (( header >= 0 )); then
     for (( i = header + 1; i < ${#lines[@]}; i++ )); do
       [[ ${lines[i]} =~ ^[[:space:]]*\[ ]] && break
-      [[ ${lines[i]} =~ $esc_key_re ]] &&
-        die "$tui has a key with escapes in its [status_line] table (${lines[i]}), which this installer does not read. Write it plainly, or set $new_line there yourself."
-      (( cmd_line < 0 )) && [[ ${lines[i]} =~ $KEY_RE ]] && cmd_line=$i
+      [[ ${lines[i]} =~ $KEY_RE ]] && { cmd_line=$i; break; }
     done
   fi
   if (( cmd_line >= 0 )); then
@@ -253,9 +251,10 @@ main() {
   fi
 
   # what to put back on uninstall: the line this replaced, and whether the table is ours
-  local old= old_command= prev_line= prev_command= created=false has_prev_line=0 has_prev_command=0
+  local old= old_command= prev_line= prev_command= created=false has_prev_line=0 has_prev_command=0 had_info=0
   read_file "$info" || die "cannot read $info"
   old=$REPLY
+  [[ -f $info ]] && had_info=1
   json_field "$old" command && old_command=$REPLY
   if (( have_current )) && [[ $current == "$command" || ( -n $old_command && $current == "$old_command" ) ]]; then
     json_field "$old" previousLine && { prev_line=$REPLY; has_prev_line=1; }
@@ -287,15 +286,25 @@ Run this installer with --force to replace it; uninstall.sh puts it back."
   done
 
   # ---------------------------------------------------------------------- write ---
+  local changed=0
+  [[ $new_raw != "$raw" ]] && changed=1
+  if (( changed )); then   # (tui.toml is written last, so find out now whether it can be)
+    if [[ -e $tui ]]; then [[ -w $tui ]] || die "cannot write $tui, so nothing was changed."
+    else [[ -w $home ]] || die "cannot create $tui, so nothing was changed."; fi
+  fi
   STAMP=$(date +%Y%m%d-%H%M%S)
   mkdir -p "$app" || die "cannot create $app"
+  replace_file() { # $1 = file, $2 = content: written whole through <file>.tmp, keeping the old file's permissions
+    printf '%s' "$2" > "$1.tmp" && { [[ ! -f $1 ]] || chmod "$(stat -f %Lp "$1")" "$1.tmp"; } &&
+      mv -f "$1.tmp" "$1" || { rm -f "$1.tmp"; return 1; }
+  }
   write_kept() { # $1 = file, $2 = content: writes it, first backing up a different old one
     if [[ -f $1 ]]; then
       read_file "$1" || die "cannot read $1"
       [[ $REPLY == "$2" ]] && return 0
       backup "$1"
     fi
-    printf '%s' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1" || { rm -f "$1.tmp"; die "cannot write $1"; }
+    replace_file "$1" "$2" || die "cannot write $1"
   }
   write_kept "$app/statusline.sh" "$script"
   chmod 755 "$app/statusline.sh"
@@ -304,22 +313,24 @@ Run this installer with --force to replace it; uninstall.sh puts it back."
   if [[ -n $jq ]]; then write_kept "$app/jq-path.txt" "$jq"$'\n'
   else rm -f "$app/jq-path.txt"; fi
 
-  # install.json before tui.toml: should tui.toml then fail, the record tells of a change not
-  # made, which is harmless (uninstall leaves a command that isn't this one alone); the
-  # other way round, the command it replaced could not be put back.
-  local j_cmd j_pc=null j_pl=null version_json now
+  (( changed )) && [[ -f $tui ]] && backup "$tui"
+  # install.json goes before tui.toml, and back to what it was should tui.toml fail after
+  # all: so it always tells of the command tui.toml runs, which is what uninstall puts back.
+  local j_cmd j_pc=null j_pl=null version_json now json
   json_str "$command"; j_cmd=$REPLY
   (( has_prev_command )) && { json_str "$prev_command"; j_pc=$REPLY; }
   (( has_prev_line )) && { json_str "$prev_line"; j_pl=$REPLY; }
   json_str "$version"; version_json=$REPLY
   now=$(date +%Y-%m-%dT%H:%M:%S%z)
-  printf '{\n  "version": %s,\n  "installedAt": "%s",\n  "command": %s,\n  "previousCommand": %s,\n  "previousLine": %s,\n  "createdTable": %s\n}\n' \
-    "$version_json" "$now" "$j_cmd" "$j_pc" "$j_pl" "$created" > "$info.tmp" && mv -f "$info.tmp" "$info" ||
-    { rm -f "$info.tmp"; die "cannot write $info, so tui.toml was left as it was."; }
-  if [[ $new_raw != "$raw" ]]; then
-    [[ -f $tui ]] && backup "$tui"
+  printf -v json '{\n  "version": %s,\n  "installedAt": "%s",\n  "command": %s,\n  "previousCommand": %s,\n  "previousLine": %s,\n  "createdTable": %s\n}\n' \
+    "$version_json" "$now" "$j_cmd" "$j_pc" "$j_pl" "$created"
+  replace_file "$info" "$json" || die "cannot write $info, so tui.toml was left as it was."
+  if (( changed )); then
     # in place, so tui.toml keeps its permissions
-    { (( bom )) && printf '\xef\xbb\xbf'; printf '%s' "$new_raw"; } > "$tui" || die "cannot write $tui"
+    if ! { (( bom )) && printf '\xef\xbb\xbf'; printf '%s' "$new_raw"; } > "$tui"; then
+      if (( had_info )); then replace_file "$info" "$old"; else rm -f "$info"; fi
+      die "cannot write $tui (see its backup), so install.json was put back as it was."
+    fi
   fi
   say "tui.toml: [status_line] $new_line"
 
