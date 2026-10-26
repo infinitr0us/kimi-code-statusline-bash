@@ -120,7 +120,7 @@ function New-KimiHome([string]$Name, [string]$BaseUrl = 'http://127.0.0.1:9/codi
     if ($NoPlan) {
         $cfg = "default_model = `"moonshot/kimi-k2`"`n`n[providers.moonshot]`ntype = `"kimi`"`nbase_url = `"http://127.0.0.1:9/v1`"`napi_key = `"sk-test`"`n`n[models.`"moonshot/kimi-k2`"]`nprovider = `"moonshot`"`nmodel = `"kimi-k2`"`n"
     } else {
-        $cfg = "default_model = `"kimi-code/k3`"`n`n[thinking]`nenabled = true`n`n[providers.`"managed:kimi-code`"]`ntype = `"kimi`"`nbase_url = `"$BaseUrl`"`n`n[providers.`"managed:kimi-code`".oauth]`nstorage = `"file`"`nkey = `"oauth/kimi-code`"`n`n[models.`"kimi-code/k3`"]`nprovider = `"managed:kimi-code`"`nmodel = `"k3`"`ndisplay_name = `"K3`"`ndefault_effort = `"high`"`n"
+        $cfg = "default_model = `"kimi-code/k3`"`n`n[thinking]`nenabled = true`n`n[secondary_model]`ndefault_model = `"kimi-code/k3-mini`"`ndefault_effort = `"low`"`n`n[providers.`"managed:kimi-code`"]`ntype = `"kimi`"`nbase_url = `"$BaseUrl`"`n`n[providers.`"managed:kimi-code`".oauth]`nstorage = `"file`"`nkey = `"oauth/kimi-code`"`n`n[models.`"kimi-code/k3`"]`nprovider = `"managed:kimi-code`"`nmodel = `"k3`"`ndisplay_name = `"K3`"`ndefault_effort = `"high`"`n"
         $exp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600
         Write-Text (Join-Path $h 'credentials\kimi-code.json') ('{"access_token":"test-token","refresh_token":"x","expires_at":' + $exp + '}')
     }

@@ -27,3 +27,23 @@ jobs:
         if: matrix.shell == 'powershell'
         shell: powershell
         run: ./tests/run-tests.ps1
+
+  test-macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bash: [system, homebrew]   # the status line on macOS's own bash 3.2, or on Homebrew's bash 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install jq if missing
+        run: command -v jq || brew install jq
+      - name: Install Homebrew's bash
+        if: matrix.bash == 'homebrew'
+        run: brew install bash
+      - name: Run tests with macOS's bash 3.2
+        if: matrix.bash == 'system'
+        run: /bin/bash tests/run-tests.sh
+      - name: Run tests with the status line on Homebrew's bash 5
+        if: matrix.bash == 'homebrew'
+        run: KSL_TEST_BASH="$(brew --prefix)/bin/bash" /bin/bash tests/run-tests.sh
