@@ -613,6 +613,33 @@ t=$'[status_line]\n"com\\u006dand" = "/tools/other.sh"\n'
 new_home 'escaped key' tui="$t"; h=$REPLY
 run_script "$REPO/install.sh" --kimi-home "$h" --force "${INSTALL_ARGS[@]}"
 [[ $CODE != 0 && $OUT == *escapes* ]] && file_is "$h/tui.toml" "$t"; check 'a [status_line] key with escapes: refused, nothing written' $? "$OUT"
+i=0
+for t in $'"status\\u005fline".command = "/tools/other.sh"\n' $'"status\\u005fline" = { command = "/tools/other.sh" }\n'; do
+  new_home "escaped top $i" tui="$t"; h=$REPLY
+  run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+  [[ $CODE != 0 && $OUT == *escapes* ]] && file_is "$h/tui.toml" "$t"; r=$?
+  (( i )) && check '... and a top-level one, as a dotted key or an inline table' $(( r + rr )) "$OUT"
+  rr=$r i=$(( i + 1 ))
+done
+# an upgrade to another bash that can't write tui.toml: the record keeps telling of the
+# command tui.toml runs, so uninstall still puts the replaced one back
+new_home 'failed upgrade' tui="$tui"; h=$REPLY
+ln -s "$TEST_BASH" "$ROOT/bash-one"; ln -s "$TEST_BASH" "$ROOT/bash-two"
+run_script "$REPO/install.sh" --kimi-home "$h" --force --bash "$ROOT/bash-one" --jq "$JQ"
+text_of "$h/tui.toml"; installed=$T
+chmod 444 "$h/tui.toml"
+run_script "$REPO/install.sh" --kimi-home "$h" --bash "$ROOT/bash-two" --jq "$JQ"
+chmod 644 "$h/tui.toml"
+[[ $CODE != 0 && $("$JQ" -r .command "$h/statusline-bash/install.json") == "$ROOT/bash-one "* ]] && file_is "$h/tui.toml" "$installed"
+check "an upgrade that can't write tui.toml: an error, nothing changed" $? "$OUT"
+run_script "$REPO/uninstall.sh" --kimi-home "$h"
+[[ $CODE == 0 ]] && file_is "$h/tui.toml" "$tui"; check '... and uninstall still puts the replaced command back' $? "$(cat "$h/tui.toml")"
+# files it replaces keep their permissions
+new_home 'kept mode' tui=; h=$REPLY
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+chmod 600 "$h/statusline-bash/install.json"
+run_script "$REPO/install.sh" --kimi-home "$h" "${INSTALL_ARGS[@]}"
+[[ $CODE == 0 && $(stat -f %Lp "$h/statusline-bash/install.json") == 600 ]]; check 'install.json keeps its permissions when rewritten' $? "$(ls -l "$h/statusline-bash")"
 # a command with a control character (\b) in it: install.json must stay valid JSON
 t=$'[status_line]\ncommand = "echo \\bhello"\n'
 new_home 'control escape' tui="$t"; h=$REPLY
