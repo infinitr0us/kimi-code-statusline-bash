@@ -34,7 +34,7 @@ Ask When Needed | K3 · max | ~/Desktop/proj | main | 5h 5% · 3h41m · 7d 52% �
 
 **Windows**
 
-- Windows 10 或 11，并已安装 [Kimi Code](https://www.kimi.com/code)。已在 Kimi Code 2.2.0 和 2.3.1 上测试。
+- Windows 10 或 11，并已安装 [Kimi Code](https://www.kimi.com/code)。已在 Kimi Code 2.2.0、2.3.1 和 2.3.2 上测试。
 - [Git for Windows](https://git-scm.com/download/win)（需要其中的 bash 5）：`winget install Git.Git`
 - [jq](https://jqlang.org)，用于额度、思考强度、改动行数和缓存倒计时：`winget install jqlang.jq`。没有 jq 时，这几部分保持为空。
 
