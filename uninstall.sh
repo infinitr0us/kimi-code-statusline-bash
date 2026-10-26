@@ -80,13 +80,31 @@ read_file() { # $1 = file -> REPLY = its content, byte for byte (but NULs); fals
   return 0
 }
 
-split_lines() { # $1 = text -> LINES = its lines, without \r\n or \n; the last one may be ""
+# A file as LINES[i] and what ended each, SEPS[i] ("\r\n", "\n", or "" for the last), so a
+# file with mixed line endings is written back as it was, but for the lines changed.
+split_lines() { # $1 = text -> LINES, SEPS (the last line may be "": the text ended with a newline)
   local s=$1 l
-  LINES=()
+  LINES=() SEPS=()
   while [[ $s == *$'\n'* ]]; do
-    l=${s%%$'\n'*}; LINES+=("${l%$'\r'}"); s=${s#*$'\n'}
+    l=${s%%$'\n'*}; s=${s#*$'\n'}
+    if [[ $l == *$'\r' ]]; then LINES+=("${l%$'\r'}"); SEPS+=($'\r\n'); else LINES+=("$l"); SEPS+=($'\n'); fi
   done
-  LINES+=("${s%$'\r'}")
+  LINES+=("$s"); SEPS+=('')
+  local crlf=0 lf=0
+  for s in "${SEPS[@]}"; do case $s in $'\r\n') crlf=$(( crlf + 1 ));; $'\n') lf=$(( lf + 1 ));; esac; done
+  NL=$'\n'; (( crlf > lf )) && NL=$'\r\n'   # for lines that have no neighbor to follow
+}
+
+join_lines() { # LINES, SEPS -> REPLY = the text
+  local i
+  REPLY=
+  for i in "${!LINES[@]}"; do REPLY+=${LINES[i]}${SEPS[i]}; done
+}
+
+remove_lines() { # $1 = first, $2 = after the last: those lines go; if they ran to the end, the line before them ends the file
+  local a=$1 b=$2 n=${#LINES[@]}
+  LINES=("${LINES[@]:0:a}" "${LINES[@]:b}"); SEPS=("${SEPS[@]:0:a}" "${SEPS[@]:b}")
+  (( b >= n && a > 0 )) && SEPS[a-1]=''
 }
 
 main() {
@@ -123,54 +141,53 @@ main() {
 
   # ------------------------------------------------------------------- tui.toml ---
   if [[ -f $tui ]]; then
-    local raw bom=0 nl=$'\n' i
+    local raw bom=0 i
     read_file "$tui" || die "cannot read $tui, so it was left as it was."
     raw=$REPLY
     [[ $raw == $'\xef\xbb\xbf'* ]] && { bom=1; raw=${raw#$'\xef\xbb\xbf'}; }
-    [[ $raw == *$'\r\n'* ]] && nl=$'\r\n'
     split_lines "$raw"
-    local lines=("${LINES[@]}")
-    local header=-1 cmd_line=-1 end=${#lines[@]} current= have_current=0
-    for i in "${!lines[@]}"; do [[ ${lines[i]} =~ $TABLE_RE ]] && { header=$i; break; }; done
+    local header=-1 cmd_line=-1 end=${#LINES[@]} current= have_current=0
+    for i in "${!LINES[@]}"; do [[ ${LINES[i]} =~ $TABLE_RE ]] && { header=$i; break; }; done
     if (( header >= 0 )); then
-      for (( i = header + 1; i < ${#lines[@]}; i++ )); do
-        [[ ${lines[i]} =~ ^[[:space:]]*\[ ]] && { end=$i; break; }
-        (( cmd_line < 0 )) && [[ ${lines[i]} =~ $KEY_RE ]] && cmd_line=$i
+      for (( i = header + 1; i < ${#LINES[@]}; i++ )); do
+        [[ ${LINES[i]} =~ ^[[:space:]]*\[ ]] && { end=$i; break; }
+        (( cmd_line < 0 )) && [[ ${LINES[i]} =~ $KEY_RE ]] && cmd_line=$i
       done
     fi
-    (( cmd_line >= 0 )) && toml_command "${lines[cmd_line]}" && { current=$REPLY; have_current=1; }
+    (( cmd_line >= 0 )) && toml_command "${LINES[cmd_line]}" && { current=$REPLY; have_current=1; }
     if (( have_current )) && [[ $current == "$default" || ( -n $recorded && $current == "$recorded" ) ]]; then
       local prev=
       json_field "$info" previousLine && prev=$REPLY
       if [[ -n $prev ]]; then
-        lines[cmd_line]=$prev
+        LINES[cmd_line]=$prev
         say "tui.toml: put back $prev"
       else
         # drop the line, and the [status_line] table too if install.sh added it and
         # nothing else is in it now
-        local empty=0 kept=()
+        local empty=0
         [[ $info =~ \"createdTable\"[[:space:]]*:[[:space:]]*true ]] && empty=1
         for (( i = header + 1; empty && i < end; i++ )); do
           (( i == cmd_line )) && continue
-          [[ ${lines[i]} =~ ^[[:space:]]*(#.*)?$ ]] || empty=0
+          [[ ${LINES[i]} =~ ^[[:space:]]*(#.*)?$ ]] || empty=0
         done
-        for i in "${!lines[@]}"; do
-          (( i == cmd_line )) && continue
-          (( empty && i >= header && i < end )) && continue
-          kept+=("${lines[i]}")
-        done
-        lines=("${kept[@]}")
+        if (( empty )); then
+          local to_end=0 last=${LINES[end-1]}
+          (( end >= ${#LINES[@]} )) && to_end=1
+          remove_lines "$header" "$end"
+          # At the end of a file without a final newline, install.sh put an empty line before
+          # the table (and no newline after it): that goes too.
+          (( to_end && header > 0 )) && [[ -n $last && -z ${LINES[header-1]} ]] && remove_lines $(( header - 1 )) "$header"
+        else
+          remove_lines "$cmd_line" $(( cmd_line + 1 ))
+        fi
         say 'tui.toml: removed the status line command; Kimi Code shows its own footer again'
       fi
       STAMP=$(date +%Y%m%d-%H%M%S)
       backup "$tui"
-      local out= first=1
-      for i in "${!lines[@]}"; do
-        if (( first )); then out=${lines[i]}; first=0; else out+=$nl${lines[i]}; fi
-      done
-      { (( bom )) && printf '\xef\xbb\xbf'; printf '%s' "$out"; } > "$tui" || die "cannot write $tui"
+      join_lines
+      { (( bom )) && printf '\xef\xbb\xbf'; printf '%s' "$REPLY"; } > "$tui" || die "cannot write $tui"
     elif (( cmd_line >= 0 )); then
-      say "tui.toml runs another status line command; left it alone: ${lines[cmd_line]}"
+      say "tui.toml runs another status line command; left it alone: ${LINES[cmd_line]}"
     fi
   fi
 

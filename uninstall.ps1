@@ -65,15 +65,32 @@ function Test-OurCommand([string]$Value, [string]$Recorded) {
     $v = & $plain $Value
     ($v -ieq (& $plain $Command)) -or ($Recorded -and $v -ieq (& $plain $Recorded))
 }
+# the lines with their own line endings, as in install.ps1
+function Split-Lines([string]$Text) {   # fills $lines and $seps
+    $start = 0
+    while (($i = $Text.IndexOf([char]10, $start)) -ge 0) {
+        $l = $Text.Substring($start, $i - $start)
+        if ($l.Length -gt 0 -and [int]$l[$l.Length - 1] -eq 13) { $lines.Add($l.Substring(0, $l.Length - 1)); $seps.Add("`r`n") }
+        else { $lines.Add($l); $seps.Add("`n") }
+        $start = $i + 1
+    }
+    $lines.Add($Text.Substring($start)); $seps.Add('')
+}
+function Remove-Lines([int]$From, [int]$To) {
+    # lines $From to $To - 1 go; if they ran to the end, the line before them ends the file
+    $toEnd = $To -ge $lines.Count
+    $lines.RemoveRange($From, $To - $From); $seps.RemoveRange($From, $To - $From)
+    if ($toEnd -and $From -gt 0) { $seps[$From - 1] = '' }
+}
 
 # ----------------------------------------------------------------- tui.toml ---
 if (Test-File $TuiPath) {
     $bytes = [IO.File]::ReadAllBytes($TuiPath)
     $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
     $raw = $Utf8.GetString($bytes).TrimStart([char]0xFEFF)
-    $nl = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
     $lines = New-Object System.Collections.Generic.List[string]
-    $lines.AddRange([string[]]($raw -split "`r?`n"))
+    $seps = New-Object System.Collections.Generic.List[string]
+    Split-Lines $raw
 
     $header = -1
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match $TableRe) { $header = $i; break } }
@@ -96,17 +113,30 @@ if (Test-File $TuiPath) {
             $lines[$cmdLine] = $previousLine
             Say "tui.toml: put back $($previousLine.Trim())"
         } else {
-            $lines.RemoveAt($cmdLine); $end--
             # drop the [status_line] table too if install.ps1 added it and nothing else is in it now
             $empty = $info -and $info.createdTable -eq $true
-            for ($i = $header + 1; $empty -and $i -lt $end; $i++) { if ($lines[$i] -notmatch '^\s*(#.*)?$') { $empty = $false } }
-            if ($empty) { $lines.RemoveRange($header, $end - $header) }
+            for ($i = $header + 1; $empty -and $i -lt $end; $i++) {
+                if ($i -ne $cmdLine -and $lines[$i] -notmatch '^\s*(#.*)?$') { $empty = $false }
+            }
+            if ($empty) {
+                $toEnd = $end -ge $lines.Count
+                $last = $lines[$end - 1]
+                Remove-Lines $header $end
+                # At the end of a file without a final newline, install.ps1 put an empty line
+                # before the table (and no newline after it): that goes too.
+                if ($toEnd -and $header -gt 0 -and $last.Length -gt 0 -and $lines[$header - 1].Length -eq 0) { Remove-Lines ($header - 1) $header }
+            } else { Remove-Lines $cmdLine ($cmdLine + 1) }
             Say 'tui.toml: removed the status line command; Kimi Code shows its own footer again'
         }
+        # a backup of its own, also when an install backed tui.toml up this same second
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        Copy-Item -LiteralPath $TuiPath -Destination "$TuiPath.bak-$stamp"
+        $b = "$TuiPath.bak-$stamp"; $n = 2
+        while (Test-Path -LiteralPath $b) { $b = "$TuiPath.bak-$stamp-$n"; $n++ }
+        Copy-Item -LiteralPath $TuiPath -Destination $b
         Say "Backed up $TuiPath"
-        $out = $Utf8.GetBytes($lines -join $nl)
+        $sb = New-Object System.Text.StringBuilder
+        for ($i = 0; $i -lt $lines.Count; $i++) { [void]$sb.Append($lines[$i]).Append($seps[$i]) }
+        $out = $Utf8.GetBytes($sb.ToString())
         if ($bom) { $out = [byte[]](0xEF, 0xBB, 0xBF) + $out }
         [IO.File]::WriteAllBytes($TuiPath, $out)
     } elseif ($cmdLine -ge 0) {
